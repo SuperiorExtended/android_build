@@ -6300,13 +6300,6 @@ bacon: otapackage
 	$(hide) ln -f $(INTERNAL_OTA_PACKAGE_TARGET) $(TARGET_PACKAGE)
 	$(hide) $(SHA256) $(TARGET_PACKAGE) > $(TARGET_PACKAGE).sha256sum
 	echo -e ""
-	echo -e ${CL_RED}"███████╗██╗   ██╗██████╗ ███████╗██████╗ ██╗ ██████╗ ██████╗      ██████╗ ███████╗ "${CL_RED}
-	echo -e ${CL_RED}"██╔════╝██║   ██║██╔══██╗██╔════╝██╔══██╗██║██╔═══██╗██╔══██╗    ██╔═══██╗██╔════╝ "${CL_RED}
-	echo -e ${CL_RED}"███████╗██║   ██║██████╔╝█████╗  ██████╔╝██║██║   ██║██████╔╝    ██║   ██║███████╗ "${CL_RED}
-	echo -e ${CL_RED}"╚════██║██║   ██║██╔═══╝ ██╔══╝  ██╔══██╗██║██║   ██║██╔══██╗    ██║   ██║╚════██║ "${CL_RED}
-	echo -e ${CL_RED}"███████║╚██████╔╝██║     ███████╗██║  ██║██║╚██████╔╝██║  ██║    ╚██████╔╝███████║ "${CL_RED}
-	echo -e ${CL_RED}"╚══════╝ ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝ ╚═════╝ ╚═╝  ╚═╝     ╚═════╝ ╚══════╝ "${CL_RED}
-	echo -e ""
 	echo -e ${CL_BLD}${CL_RED}"===============================-Package complete-==============================="${CL_RED}
 	echo -e ${CL_BLD}${CL_GRN}"Zip: "${CL_RED} $(TARGET_PACKAGE)${CL_RST}
 	echo -e ${CL_BLD}${CL_GRN}"SHA256: "${CL_RED}" `cat $(TARGET_PACKAGE).sha256sum | awk '{print $$1}' `"${CL_RST}
