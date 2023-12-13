@@ -61,7 +61,7 @@ else
   apex_test_module := art-check-release-apex-gen-fakebin
 endif
 
-ifeq (true,$(SOONG_CONFIG_art_module_source_build)
+ifeq (true,$(call soong_config_get,art_module,source_build))
   PRODUCT_HOST_PACKAGES += $(apex_test_module)
 endif
 
@@ -75,6 +75,14 @@ PRODUCT_PACKAGES += \
 PRODUCT_PACKAGES += \
     hiddenapi-package-whitelist.xml \
 
+ifeq (,$(TARGET_BUILD_UNBUNDLED))
+  # Don't depend on the framework boot image profile in unbundled builds where
+  # frameworks/base may not be present.
+  # TODO(b/179900989): We may not need this check once we stop using full
+  # platform products on the thin ART manifest branch.
+  PRODUCT_DEX_PREOPT_BOOT_IMAGE_PROFILE_LOCATION += frameworks/base/boot/boot-image-profile.txt
+endif
+
 # The dalvik.vm.dexopt.thermal-cutoff property must contain one of the values
 # listed here:
 #
@@ -87,7 +95,6 @@ PRODUCT_PACKAGES += \
 # The thermal cutoff value is currently set to THERMAL_STATUS_MODERATE.
 PRODUCT_SYSTEM_PROPERTIES += \
     dalvik.vm.usejit=true \
-    dalvik.vm.usejitprofiles=true \
     dalvik.vm.dexopt.secondary=true \
     dalvik.vm.dexopt.thermal-cutoff=2 \
     dalvik.vm.appimageformat=lz4
@@ -115,6 +122,7 @@ endif
 # without exceptions).
 PRODUCT_SYSTEM_PROPERTIES += \
     pm.dexopt.post-boot?=extract \
+    pm.dexopt.boot-after-mainline-update?=verify \
     pm.dexopt.install?=speed-profile \
     pm.dexopt.install-fast?=skip \
     pm.dexopt.install-bulk?=speed-profile \
@@ -140,17 +148,6 @@ PRODUCT_SYSTEM_PROPERTIES += \
     dalvik.vm.minidebuginfo=true \
     dalvik.vm.dex2oat-minidebuginfo=true
 
-# Two other device configs are added to IORap besides "ro.iorapd.enable".
-# IORap by default is off and starts when
-# (https://source.corp.google.com/android/system/iorap/iorapd.rc?q=iorapd.rc)
-#
-# * "ro.iorapd.enable" is true excluding unset
-# * One of the device configs is true.
-#
-# "ro.iorapd.enable" has to be set to true, so that iorap can be started.
-PRODUCT_SYSTEM_PROPERTIES += \
-    ro.iorapd.enable?=true
-
 # Enable Madvising of the whole art, odex and vdex files to MADV_WILLNEED.
 # The size specified here is the size limit of how much of the file
 # (in bytes) is madvised.
@@ -160,3 +157,24 @@ PRODUCT_SYSTEM_PROPERTIES += \
     dalvik.vm.madvise.vdexfile.size=104857600 \
     dalvik.vm.madvise.odexfile.size=104857600 \
     dalvik.vm.madvise.artfile.size=4294967295
+
+# Properties for the Unspecialized App Process Pool
+PRODUCT_SYSTEM_PROPERTIES += \
+    dalvik.vm.usap_pool_enabled?=false \
+    dalvik.vm.usap_refill_threshold?=1 \
+    dalvik.vm.usap_pool_size_max?=3 \
+    dalvik.vm.usap_pool_size_min?=1 \
+    dalvik.vm.usap_pool_refill_delay_ms?=3000
+
+# Allow dexopt files that are side-effects of already allowlisted files.
+# This is only necessary when ART is prebuilt.
+ifeq (false,$(ART_MODULE_BUILD_FROM_SOURCE))
+  PRODUCT_ARTIFACT_PATH_REQUIREMENT_ALLOWED_LIST += \
+      system/framework/%.art \
+      system/framework/%.oat \
+      system/framework/%.odex \
+      system/framework/%.vdex
+endif
+
+PRODUCT_SYSTEM_PROPERTIES += \
+    dalvik.vm.useartservice=true

@@ -40,6 +40,26 @@ general_tests_configs_zip := $(PRODUCT_OUT)/general-tests_configs.zip
 # Create an artifact to include all shared librariy files in general-tests.
 general_tests_host_shared_libs_zip := $(PRODUCT_OUT)/general-tests_host-shared-libs.zip
 
+# Copy kernel test modules to testcases directories
+include $(BUILD_SYSTEM)/tasks/tools/vts-kernel-tests.mk
+ltp_copy_pairs := \
+  $(call target-native-copy-pairs,$(kernel_ltp_modules),$(kernel_ltp_host_out))
+kselftest_copy_pairs := \
+  $(call target-native-copy-pairs,$(kernel_kselftest_modules),$(kernel_kselftest_host_out))
+copy_ltp_tests := $(call copy-many-files,$(ltp_copy_pairs))
+copy_kselftest_tests := $(call copy-many-files,$(kselftest_copy_pairs))
+
+# PHONY target to be used to build and test `vts_ltp_tests` and `vts_kselftest_tests` without building full vts
+.PHONY: vts_kernel_ltp_tests
+vts_kernel_ltp_tests: $(copy_ltp_tests)
+
+.PHONY: vts_kernel_kselftest_tests
+vts_kernel_kselftest_tests: $(copy_kselftest_tests)
+
+$(general_tests_zip) : $(copy_ltp_tests)
+$(general_tests_zip) : $(copy_kselftest_tests)
+$(general_tests_zip) : PRIVATE_KERNEL_LTP_HOST_OUT := $(kernel_ltp_host_out)
+$(general_tests_zip) : PRIVATE_KERNEL_KSELFTEST_HOST_OUT := $(kernel_kselftest_host_out)
 $(general_tests_zip) : PRIVATE_general_tests_list_zip := $(general_tests_list_zip)
 $(general_tests_zip) : .KATI_IMPLICIT_OUTPUTS := $(general_tests_list_zip) $(general_tests_configs_zip) $(general_tests_host_shared_libs_zip)
 $(general_tests_zip) : PRIVATE_TOOLS := $(general_tests_tools)
@@ -52,6 +72,8 @@ $(general_tests_zip) : $(COMPATIBILITY.general-tests.FILES) $(general_tests_tool
 	rm -f $@ $(PRIVATE_general_tests_list_zip)
 	mkdir -p $(PRIVATE_INTERMEDIATES_DIR) $(PRIVATE_INTERMEDIATES_DIR)/tools
 	echo $(sort $(COMPATIBILITY.general-tests.FILES)) | tr " " "\n" > $(PRIVATE_INTERMEDIATES_DIR)/list
+	find $(PRIVATE_KERNEL_LTP_HOST_OUT) >> $(PRIVATE_INTERMEDIATES_DIR)/list
+	find $(PRIVATE_KERNEL_KSELFTEST_HOST_OUT) >> $(PRIVATE_INTERMEDIATES_DIR)/list
 	grep $(HOST_OUT_TESTCASES) $(PRIVATE_INTERMEDIATES_DIR)/list > $(PRIVATE_INTERMEDIATES_DIR)/host.list || true
 	grep $(TARGET_OUT_TESTCASES) $(PRIVATE_INTERMEDIATES_DIR)/list > $(PRIVATE_INTERMEDIATES_DIR)/target.list || true
 	grep -e .*\\.config$$ $(PRIVATE_INTERMEDIATES_DIR)/host.list > $(PRIVATE_INTERMEDIATES_DIR)/host-test-configs.list || true
@@ -65,7 +87,8 @@ $(general_tests_zip) : $(COMPATIBILITY.general-tests.FILES) $(general_tests_tool
 	$(SOONG_ZIP) -d -o $@ \
 	  -P host -C $(PRIVATE_INTERMEDIATES_DIR) -D $(PRIVATE_INTERMEDIATES_DIR)/tools \
 	  -P host -C $(HOST_OUT) -l $(PRIVATE_INTERMEDIATES_DIR)/host.list \
-	  -P target -C $(PRODUCT_OUT) -l $(PRIVATE_INTERMEDIATES_DIR)/target.list
+	  -P target -C $(PRODUCT_OUT) -l $(PRIVATE_INTERMEDIATES_DIR)/target.list \
+	  -sha256
 	$(SOONG_ZIP) -d -o $(PRIVATE_general_tests_configs_zip) \
 	  -P host -C $(HOST_OUT) -l $(PRIVATE_INTERMEDIATES_DIR)/host-test-configs.list \
 	  -P target -C $(PRODUCT_OUT) -l $(PRIVATE_INTERMEDIATES_DIR)/target-test-configs.list
@@ -77,6 +100,9 @@ $(general_tests_zip) : $(COMPATIBILITY.general-tests.FILES) $(general_tests_tool
 
 general-tests: $(general_tests_zip)
 $(call dist-for-goals, general-tests, $(general_tests_zip) $(general_tests_list_zip) $(general_tests_configs_zip) $(general_tests_host_shared_libs_zip))
+
+$(call declare-1p-container,$(general_tests_zip),)
+$(call declare-container-license-deps,$(general_tests_zip),$(COMPATIBILITY.general-tests.FILES) $(general_tests_tools) $(my_host_shared_lib_for_general_tests),$(PRODUCT_OUT)/:/)
 
 intermediates_dir :=
 general_tests_tools :=

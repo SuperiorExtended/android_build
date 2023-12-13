@@ -124,7 +124,7 @@ def EntriesForUserImages(input_file):
 
   for image_path in [name for name in namelist if name.startswith('IMAGES/')]:
     image = os.path.basename(image_path)
-    if OPTIONS.bootable_only and image not in('boot.img', 'recovery.img', 'bootloader'):
+    if OPTIONS.bootable_only and image not in('boot.img', 'recovery.img', 'bootloader', 'init_boot.img'):
       continue
     if not image.endswith('.img') and image != 'bootloader':
       continue
@@ -173,7 +173,7 @@ def RebuildAndWriteSuperImages(input_file, output_file):
   logger.info('Writing super.img to archive...')
   with zipfile.ZipFile(
       output_file, 'a', compression=zipfile.ZIP_DEFLATED,
-      allowZip64=not OPTIONS.sparse_userimages) as output_zip:
+      allowZip64=True) as output_zip:
     common.ZipWrite(output_zip, super_file, 'super.img')
 
 
@@ -251,8 +251,5 @@ if __name__ == '__main__':
   try:
     common.CloseInheritedPipes()
     main(sys.argv[1:])
-  except common.ExternalError as e:
-    logger.exception('\n   ERROR:\n')
-    sys.exit(1)
   finally:
     common.Cleanup()

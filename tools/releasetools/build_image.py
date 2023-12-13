@@ -24,6 +24,7 @@ Usage:  build_image input_directory properties_file output_image \\
 
 from __future__ import print_function
 
+import glob
 import logging
 import os
 import os.path
@@ -231,11 +232,13 @@ def CheckHeadroom(ext4fs_output, prop_dict):
             mount_point, total_blocks, used_blocks, headroom_blocks,
             adjusted_blocks))
 
+
 def CalculateSizeAndReserved(prop_dict, size):
   fs_type = prop_dict.get("fs_type", "")
   partition_headroom = int(prop_dict.get("partition_headroom", 0))
   # If not specified, give us 16MB margin for GetDiskUsage error ...
-  reserved_size = int(prop_dict.get("partition_reserved_size", BYTES_IN_MB * 16))
+  reserved_size = int(prop_dict.get(
+      "partition_reserved_size", BYTES_IN_MB * 16))
 
   if fs_type == "erofs":
     reserved_size = int(prop_dict.get("partition_reserved_size", 0))
@@ -247,6 +250,7 @@ def CalculateSizeAndReserved(prop_dict, size):
     reserved_size = partition_headroom
 
   return size + reserved_size
+
 
 def BuildImageMkfs(in_dir, prop_dict, out_file, target_out, fs_config):
   """Builds a pure image for the files under in_dir and writes it to out_file.
@@ -267,18 +271,19 @@ def BuildImageMkfs(in_dir, prop_dict, out_file, target_out, fs_config):
   """
   build_command = []
   fs_type = prop_dict.get("fs_type", "")
-  run_e2fsck = False
+  run_fsck = None
   needs_projid = prop_dict.get("needs_projid", 0)
   needs_casefold = prop_dict.get("needs_casefold", 0)
   needs_compress = prop_dict.get("needs_compress", 0)
 
   disable_sparse = "disable_sparse" in prop_dict
+  manual_sparse = False
 
   if fs_type.startswith("ext"):
     build_command = [prop_dict["ext_mkuserimg"]]
     if "extfs_sparse_flag" in prop_dict and not disable_sparse:
       build_command.append(prop_dict["extfs_sparse_flag"])
-      run_e2fsck = True
+      run_e2fsck = RunE2fsck
     build_command.extend([in_dir, out_file, fs_type,
                           prop_dict["mount_point"]])
     build_command.append(prop_dict["image_size"])
@@ -319,36 +324,51 @@ def BuildImageMkfs(in_dir, prop_dict, out_file, target_out, fs_config):
     if "selinux_fc" in prop_dict:
       build_command.append(prop_dict["selinux_fc"])
   elif fs_type.startswith("erofs"):
-    build_command = ["mkerofsimage.sh"]
-    build_command.extend([in_dir, out_file])
-    if "erofs_sparse_flag" in prop_dict and not disable_sparse:
-      build_command.extend([prop_dict["erofs_sparse_flag"]])
-    build_command.extend(["-m", prop_dict["mount_point"]])
-    if target_out:
-      build_command.extend(["-d", target_out])
-    if fs_config:
-      build_command.extend(["-C", fs_config])
-    if "selinux_fc" in prop_dict:
-      build_command.extend(["-c", prop_dict["selinux_fc"]])
+    build_command = ["mkfs.erofs"]
+
     compressor = None
     if "erofs_default_compressor" in prop_dict:
       compressor = prop_dict["erofs_default_compressor"]
     if "erofs_compressor" in prop_dict:
       compressor = prop_dict["erofs_compressor"]
-    if compressor:
+    if compressor and compressor != "none":
       build_command.extend(["-z", compressor])
+
+    compress_hints = None
+    if "erofs_default_compress_hints" in prop_dict:
+      compress_hints = prop_dict["erofs_default_compress_hints"]
+    if "erofs_compress_hints" in prop_dict:
+      compress_hints = prop_dict["erofs_compress_hints"]
+    if compress_hints:
+      build_command.extend(["--compress-hints", compress_hints])
+
+    build_command.extend(["--mount-point", prop_dict["mount_point"]])
+    if target_out:
+      build_command.extend(["--product-out", target_out])
+    if fs_config:
+      build_command.extend(["--fs-config-file", fs_config])
+    if "selinux_fc" in prop_dict:
+      build_command.extend(["--file-contexts", prop_dict["selinux_fc"]])
     if "timestamp" in prop_dict:
       build_command.extend(["-T", str(prop_dict["timestamp"])])
     if "uuid" in prop_dict:
       build_command.extend(["-U", prop_dict["uuid"]])
     if "block_list" in prop_dict:
-      build_command.extend(["-B", prop_dict["block_list"]])
+      build_command.extend(["--block-list-file", prop_dict["block_list"]])
     if "erofs_pcluster_size" in prop_dict:
-      build_command.extend(["-P", prop_dict["erofs_pcluster_size"]])
+      build_command.extend(["-C", prop_dict["erofs_pcluster_size"]])
     if "erofs_share_dup_blocks" in prop_dict:
-      build_command.extend(["-k", "4096"])
+      build_command.extend(["--chunksize", "4096"])
+    if "erofs_use_legacy_compression" in prop_dict:
+      build_command.extend(["-E", "legacy-compress"])
+
+    build_command.extend([out_file, in_dir])
+    if "erofs_sparse_flag" in prop_dict and not disable_sparse:
+      manual_sparse = True
+
+    run_fsck = RunErofsFsck
   elif fs_type.startswith("squash"):
-    build_command = ["mksquashfsimage.sh"]
+    build_command = ["mksquashfsimage"]
     build_command.extend([in_dir, out_file])
     if "squashfs_sparse_flag" in prop_dict and not disable_sparse:
       build_command.extend([prop_dict["squashfs_sparse_flag"]])
@@ -370,7 +390,7 @@ def BuildImageMkfs(in_dir, prop_dict, out_file, target_out, fs_config):
     if prop_dict.get("squashfs_disable_4k_align") == "true":
       build_command.extend(["-a"])
   elif fs_type.startswith("f2fs"):
-    build_command = ["mkf2fsuserimg.sh"]
+    build_command = ["mkf2fsuserimg"]
     build_command.extend([out_file, prop_dict["image_size"]])
     if "f2fs_sparse_flag" in prop_dict and not disable_sparse:
       build_command.extend([prop_dict["f2fs_sparse_flag"]])
@@ -393,7 +413,7 @@ def BuildImageMkfs(in_dir, prop_dict, out_file, target_out, fs_config):
       build_command.append("--casefold")
     if (needs_compress or prop_dict.get("f2fs_compress") == "true"):
       build_command.append("--compression")
-    if (prop_dict.get("mount_point") != "data"):
+    if "ro_mount_point" in prop_dict:
       build_command.append("--readonly")
     if (prop_dict.get("f2fs_compress") == "true"):
       build_command.append("--sldc")
@@ -435,17 +455,36 @@ def BuildImageMkfs(in_dir, prop_dict, out_file, target_out, fs_config):
               int(prop_dict["partition_size"]) // BYTES_IN_MB))
     raise
 
-  if run_e2fsck and prop_dict.get("skip_fsck") != "true":
-    unsparse_image = UnsparseImage(out_file, replace=False)
+  if run_fsck and prop_dict.get("skip_fsck") != "true":
+    run_fsck(out_file)
 
-    # Run e2fsck on the inflated image file
-    e2fsck_command = ["e2fsck", "-f", "-n", unsparse_image]
-    try:
-      common.RunAndCheckOutput(e2fsck_command)
-    finally:
-      os.remove(unsparse_image)
+  if manual_sparse:
+    temp_file = out_file + ".sparse"
+    img2simg_argv = ["img2simg", out_file, temp_file]
+    common.RunAndCheckOutput(img2simg_argv)
+    os.rename(temp_file, out_file)
 
   return mkfs_output
+
+
+def RunE2fsck(out_file):
+  unsparse_image = UnsparseImage(out_file, replace=False)
+
+  # Run e2fsck on the inflated image file
+  e2fsck_command = ["e2fsck", "-f", "-n", unsparse_image]
+  try:
+    common.RunAndCheckOutput(e2fsck_command)
+  finally:
+    os.remove(unsparse_image)
+
+
+def RunErofsFsck(out_file):
+  fsck_command = ["fsck.erofs", "--extract", out_file]
+  try:
+    common.RunAndCheckOutput(fsck_command)
+  except:
+    print("Check failed for EROFS image {}".format(out_file))
+    raise
 
 
 def BuildImage(in_dir, prop_dict, out_file, target_out=None):
@@ -482,11 +521,12 @@ def BuildImage(in_dir, prop_dict, out_file, target_out=None):
   disable_sparse = "disable_sparse" in prop_dict
   mkfs_output = None
   if (prop_dict.get("use_dynamic_partition_size") == "true" and
-      "partition_size" not in prop_dict):
+          "partition_size" not in prop_dict):
     # If partition_size is not defined, use output of `du' + reserved_size.
     # For compressed file system, it's better to use the compressed size to avoid wasting space.
     if fs_type.startswith("erofs"):
-      mkfs_output = BuildImageMkfs(in_dir, prop_dict, out_file, target_out, fs_config)
+      mkfs_output = BuildImageMkfs(
+          in_dir, prop_dict, out_file, target_out, fs_config)
       if "erofs_sparse_flag" in prop_dict and not disable_sparse:
         image_path = UnsparseImage(out_file, replace=False)
         size = GetDiskUsage(image_path)
@@ -576,7 +616,12 @@ def BuildImage(in_dir, prop_dict, out_file, target_out=None):
     prop_dict["image_size"] = str(max_image_size)
 
   if not mkfs_output:
-    mkfs_output = BuildImageMkfs(in_dir, prop_dict, out_file, target_out, fs_config)
+    mkfs_output = BuildImageMkfs(
+        in_dir, prop_dict, out_file, target_out, fs_config)
+
+  # Update the image (eg filesystem size). This can be different eg if mkfs
+  # rounds the requested size down due to alignment.
+  prop_dict["image_size"] = common.sparse_img.GetImagePartitionSize(out_file)
 
   # Check if there's enough headroom space available for ext4 image.
   if "partition_headroom" in prop_dict and fs_type.startswith("ext4"):
@@ -621,20 +666,17 @@ def ImagePropFromGlobalDict(glob_dict, mount_point):
   common_props = (
       "extfs_sparse_flag",
       "erofs_default_compressor",
+      "erofs_default_compress_hints",
       "erofs_pcluster_size",
       "erofs_share_dup_blocks",
       "erofs_sparse_flag",
+      "erofs_use_legacy_compression",
       "squashfs_sparse_flag",
       "system_f2fs_compress",
       "system_f2fs_sldc_flags",
       "f2fs_sparse_flag",
       "skip_fsck",
       "ext_mkuserimg",
-      "verity",
-      "verity_key",
-      "verity_signer_cmd",
-      "verity_fec",
-      "verity_disable",
       "avb_enable",
       "avb_avbtool",
       "use_dynamic_partition_size",
@@ -648,6 +690,7 @@ def ImagePropFromGlobalDict(glob_dict, mount_point):
       "oem",
       "product",
       "system",
+      "system_dlkm",
       "system_ext",
       "system_other",
       "vendor",
@@ -668,10 +711,12 @@ def ImagePropFromGlobalDict(glob_dict, mount_point):
       (True, "avb_{}_hashtree_enable", "avb_hashtree_enable"),
       (True, "avb_{}_key_path", "avb_key_path"),
       (True, "avb_{}_salt", "avb_salt"),
+      (True, "erofs_use_legacy_compression", "erofs_use_legacy_compression"),
       (True, "ext4_share_dup_blocks", "ext4_share_dup_blocks"),
       (True, "{}_base_fs_file", "base_fs_file"),
       (True, "{}_disable_sparse", "disable_sparse"),
       (True, "{}_erofs_compressor", "erofs_compressor"),
+      (True, "{}_erofs_compress_hints", "erofs_compress_hints"),
       (True, "{}_erofs_pcluster_size", "erofs_pcluster_size"),
       (True, "{}_erofs_share_dup_blocks", "erofs_share_dup_blocks"),
       (True, "{}_extfs_inode_count", "extfs_inode_count"),
@@ -699,9 +744,9 @@ def ImagePropFromGlobalDict(glob_dict, mount_point):
       # This property is legacy and only used on a few partitions. b/202600377
       allowed_partitions = set(["system", "system_other", "data", "oem"])
       if mount_point not in allowed_partitions:
-          continue
+        continue
 
-    if mount_point == "system_other":
+    if (mount_point == "system_other") and (dest_prop != "partition_size"):
       # Propagate system properties to system_other. They'll get overridden
       # after as needed.
       copy_prop(src_prop.format("system"), dest_prop)
@@ -717,6 +762,8 @@ def ImagePropFromGlobalDict(glob_dict, mount_point):
     prop = "{}_extfs_rsv_pct".format(prefix)
     if not copy_prop(prop, "extfs_rsv_pct"):
       d["extfs_rsv_pct"] = "0"
+
+    d["ro_mount_point"] = "1"
 
   # Copy partition-specific properties.
   d["mount_point"] = mount_point
@@ -752,6 +799,7 @@ def LoadGlobalDict(filename):
 
 def GlobalDictFromImageProp(image_prop, mount_point):
   d = {}
+
   def copy_prop(src_p, dest_p):
     if src_p in image_prop:
       d[dest_p] = image_prop[src_p]
@@ -770,6 +818,8 @@ def GlobalDictFromImageProp(image_prop, mount_point):
     copy_prop("partition_size", "vendor_dlkm_size")
   elif mount_point == "odm_dlkm":
     copy_prop("partition_size", "odm_dlkm_size")
+  elif mount_point == "system_dlkm":
+    copy_prop("partition_size", "system_dlkm_size")
   elif mount_point == "product":
     copy_prop("partition_size", "product_size")
   elif mount_point == "system_ext":
@@ -777,17 +827,69 @@ def GlobalDictFromImageProp(image_prop, mount_point):
   return d
 
 
+def BuildVBMeta(in_dir, glob_dict, output_path):
+  """Creates a VBMeta image.
+
+  It generates the requested VBMeta image. The requested image could be for
+  top-level or chained VBMeta image, which is determined based on the name.
+
+  Args:
+    output_path: Path to generated vbmeta.img
+    partitions: A dict that's keyed by partition names with image paths as
+        values. Only valid partition names are accepted, as partitions listed
+        in common.AVB_PARTITIONS and custom partitions listed in
+        OPTIONS.info_dict.get("avb_custom_images_partition_list")
+    name: Name of the VBMeta partition, e.g. 'vbmeta', 'vbmeta_system'.
+    needed_partitions: Partitions whose descriptors should be included into the
+        generated VBMeta image.
+
+  Returns:
+    Path to the created image.
+
+  Raises:
+    AssertionError: On invalid input args.
+  """
+  vbmeta_partitions = common.AVB_PARTITIONS[:]
+  name = os.path.basename(output_path).rstrip(".img")
+  vbmeta_system = glob_dict.get("avb_vbmeta_system", "").strip()
+  vbmeta_vendor = glob_dict.get("avb_vbmeta_vendor", "").strip()
+  if "vbmeta_system" in name:
+    vbmeta_partitions = vbmeta_system.split()
+  elif "vbmeta_vendor" in name:
+    vbmeta_partitions = vbmeta_vendor.split()
+  else:
+    if vbmeta_system:
+      vbmeta_partitions = [
+          item for item in vbmeta_partitions
+          if item not in vbmeta_system.split()]
+      vbmeta_partitions.append("vbmeta_system")
+
+    if vbmeta_vendor:
+      vbmeta_partitions = [
+          item for item in vbmeta_partitions
+          if item not in vbmeta_vendor.split()]
+      vbmeta_partitions.append("vbmeta_vendor")
+
+
+  partitions = {part: os.path.join(in_dir, part + ".img")
+                for part in vbmeta_partitions}
+  partitions = {part:path for (part, path) in partitions.items() if os.path.exists(path)}
+  common.BuildVBMeta(output_path, partitions, name, vbmeta_partitions)
+
+
 def main(argv):
-  if len(argv) != 4:
+  args = common.ParseOptions(argv, __doc__)
+
+  if len(args) != 4:
     print(__doc__)
     sys.exit(1)
 
   common.InitLogging()
 
-  in_dir = argv[0]
-  glob_dict_file = argv[1]
-  out_file = argv[2]
-  target_out = argv[3]
+  in_dir = args[0]
+  glob_dict_file = args[1]
+  out_file = args[2]
+  target_out = args[3]
 
   glob_dict = LoadGlobalDict(glob_dict_file)
   if "mount_point" in glob_dict:
@@ -813,20 +915,29 @@ def main(argv):
       mount_point = "vendor_dlkm"
     elif image_filename == "odm_dlkm.img":
       mount_point = "odm_dlkm"
+    elif image_filename == "system_dlkm.img":
+      mount_point = "system_dlkm"
     elif image_filename == "oem.img":
       mount_point = "oem"
     elif image_filename == "product.img":
       mount_point = "product"
     elif image_filename == "system_ext.img":
       mount_point = "system_ext"
+    elif "vbmeta" in image_filename:
+      mount_point = "vbmeta"
     else:
       logger.error("Unknown image file name %s", image_filename)
       sys.exit(1)
 
-    image_properties = ImagePropFromGlobalDict(glob_dict, mount_point)
+    if "vbmeta" != mount_point:
+      image_properties = ImagePropFromGlobalDict(glob_dict, mount_point)
 
   try:
-    BuildImage(in_dir, image_properties, out_file, target_out)
+    if "vbmeta" in os.path.basename(out_file):
+      OPTIONS.info_dict = glob_dict
+      BuildVBMeta(in_dir, glob_dict, out_file)
+    else:
+      BuildImage(in_dir, image_properties, out_file, target_out)
   except:
     logger.error("Failed to build %s from %s", out_file, in_dir)
     raise

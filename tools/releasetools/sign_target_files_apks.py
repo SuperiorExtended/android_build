@@ -27,7 +27,7 @@ Usage:  sign_target_files_apks [flags] input_target_files output_target_files
       apkcerts.txt file, or the container key for an APEX. Option may be
       repeated to give multiple extra packages.
 
-  --extra_apex_payload_key <name=key>
+  --extra_apex_payload_key <name,name,...=key>
       Add a mapping for APEX package name to payload signing key, which will
       override the default payload signing key in apexkeys.txt. Note that the
       container key should be overridden via the `--extra_apks` flag above.
@@ -99,15 +99,15 @@ Usage:  sign_target_files_apks [flags] input_target_files output_target_files
       The second dir will be used for lookup if BOARD_USES_RECOVERY_AS_BOOT is
       set to true.
 
-  --avb_{boot,system,system_other,vendor,dtbo,vbmeta,vbmeta_system,
-         vbmeta_vendor}_algorithm <algorithm>
-  --avb_{boot,system,system_other,vendor,dtbo,vbmeta,vbmeta_system,
-         vbmeta_vendor}_key <key>
+  --avb_{boot,init_boot,recovery,system,system_other,vendor,dtbo,vbmeta,
+         vbmeta_system,vbmeta_vendor}_algorithm <algorithm>
+  --avb_{boot,init_boot,recovery,system,system_other,vendor,dtbo,vbmeta,
+         vbmeta_system,vbmeta_vendor}_key <key>
       Use the specified algorithm (e.g. SHA256_RSA4096) and the key to AVB-sign
       the specified image. Otherwise it uses the existing values in info dict.
 
-  --avb_{apex,boot,system,system_other,vendor,dtbo,vbmeta,vbmeta_system,
-         vbmeta_vendor}_extra_args <args>
+  --avb_{apex,init_boot,boot,recovery,system,system_other,vendor,dtbo,vbmeta,
+         vbmeta_system,vbmeta_vendor}_extra_args <args>
       Specify any additional args that are needed to AVB-sign the image
       (e.g. "--signing_helper /path/to/helper"). The args will be appended to
       the existing ones in info dict.
@@ -141,6 +141,12 @@ Usage:  sign_target_files_apks [flags] input_target_files output_target_files
       Allow the existence of the file 'userdebug_plat_sepolicy.cil' under
       (/system/system_ext|/system_ext)/etc/selinux.
       If not set, error out when the file exists.
+
+  --override_apk_keys <path>
+      Replace all APK keys with this private key
+
+  --override_apex_keys <path>
+      Replace all APEX keys with this private key
 """
 
 from __future__ import print_function
@@ -182,9 +188,6 @@ OPTIONS.skip_apks_with_path_prefix = set()
 OPTIONS.key_map = {}
 OPTIONS.rebuild_recovery = False
 OPTIONS.replace_ota_keys = False
-OPTIONS.replace_verity_public_key = False
-OPTIONS.replace_verity_private_key = False
-OPTIONS.replace_verity_keyid = False
 OPTIONS.remove_avb_public_keys = None
 OPTIONS.tag_changes = ("-test-keys", "-dev-keys", "+release-keys")
 OPTIONS.avb_keys = {}
@@ -197,14 +200,18 @@ OPTIONS.android_jar_path = None
 OPTIONS.vendor_partitions = set()
 OPTIONS.vendor_otatools = None
 OPTIONS.allow_gsi_debug_sepolicy = False
+OPTIONS.override_apk_keys = None
+OPTIONS.override_apex_keys = None
 
 
 AVB_FOOTER_ARGS_BY_PARTITION = {
     'boot': 'avb_boot_add_hash_footer_args',
+    'init_boot': 'avb_init_boot_add_hash_footer_args',
     'dtbo': 'avb_dtbo_add_hash_footer_args',
     'product': 'avb_product_add_hashtree_footer_args',
     'recovery': 'avb_recovery_add_hash_footer_args',
     'system': 'avb_system_add_hashtree_footer_args',
+    'system_dlkm': "avb_system_dlkm_add_hashtree_footer_args",
     'system_ext': 'avb_system_ext_add_hashtree_footer_args',
     'system_other': 'avb_system_other_add_hashtree_footer_args',
     'odm': 'avb_odm_add_hashtree_footer_args',
@@ -212,6 +219,7 @@ AVB_FOOTER_ARGS_BY_PARTITION = {
     'pvmfw': 'avb_pvmfw_add_hash_footer_args',
     'vendor': 'avb_vendor_add_hashtree_footer_args',
     'vendor_boot': 'avb_vendor_boot_add_hash_footer_args',
+    'vendor_kernel_boot': 'avb_vendor_kernel_boot_add_hash_footer_args',
     'vendor_dlkm': "avb_vendor_dlkm_add_hashtree_footer_args",
     'vbmeta': 'avb_vbmeta_args',
     'vbmeta_system': 'avb_vbmeta_system_args',
@@ -242,6 +250,10 @@ def GetApexFilename(filename):
 
 
 def GetApkCerts(certmap):
+  if OPTIONS.override_apk_keys is not None:
+    for apk in certmap.keys():
+      certmap[apk] = OPTIONS.override_apk_keys
+
   # apply the key remapping to the contents of the file
   for apk, cert in certmap.items():
     certmap[apk] = OPTIONS.key_map.get(cert, cert)
@@ -272,6 +284,15 @@ def GetApexKeys(keys_info, key_map):
   Raises:
     AssertionError: On invalid container / payload key overrides.
   """
+  if OPTIONS.override_apex_keys is not None:
+    for apex in keys_info.keys():
+      keys_info[apex] = (OPTIONS.override_apex_keys, keys_info[apex][1], keys_info[apex][2])
+
+  if OPTIONS.override_apk_keys is not None:
+    key = key_map.get(OPTIONS.override_apk_keys, OPTIONS.override_apk_keys)
+    for apex in keys_info.keys():
+      keys_info[apex] = (keys_info[apex][0], key, keys_info[apex][2])
+
   # Apply all the --extra_apex_payload_key options to override the payload
   # signing keys in the given keys_info.
   for apex, key in OPTIONS.extra_apex_payload_keys.items():
@@ -510,7 +531,14 @@ def IsBuildPropFile(filename):
       # RECOVERY/RAMDISK/default.prop is a legacy path, but will always exist
       # as a symlink in the current code. So it's a no-op here. Keeping the
       # path here for clarity.
-      "RECOVERY/RAMDISK/default.prop") or filename.endswith("build.prop")
+      # Some build props might be stored under path
+      # VENDOR_BOOT/RAMDISK_FRAGMENTS/recovery/RAMDISK/default.prop, and
+      # default.prop can be a symbolic link to prop.default, so overwrite all
+      # files that ends with build.prop, default.prop or prop.default
+      "RECOVERY/RAMDISK/default.prop") or \
+        filename.endswith("build.prop") or \
+        filename.endswith("/default.prop") or \
+        filename.endswith("/prop.default")
 
 
 def ProcessTargetFiles(input_tf_zip, output_tf_zip, misc_info,
@@ -519,9 +547,14 @@ def ProcessTargetFiles(input_tf_zip, output_tf_zip, misc_info,
                        compressed_extension):
   # maxsize measures the maximum filename length, including the ones to be
   # skipped.
-  maxsize = max(
-      [len(os.path.basename(i.filename)) for i in input_tf_zip.infolist()
-       if GetApkFileInfo(i.filename, compressed_extension, [])[0]])
+  try:
+    maxsize = max(
+        [len(os.path.basename(i.filename)) for i in input_tf_zip.infolist()
+         if GetApkFileInfo(i.filename, compressed_extension, [])[0]])
+  except ValueError:
+    # Sets this to zero for targets without APK files, e.g., gki_arm64.
+    maxsize = 0
+
   system_root_image = misc_info.get("system_root_image") == "true"
 
   for info in input_tf_zip.infolist():
@@ -608,7 +641,7 @@ def ProcessTargetFiles(input_tf_zip, output_tf_zip, misc_info,
       common.ZipWriteStr(output_tf_zip, out_info, new_data)
 
     # Replace the certs in *mac_permissions.xml (there could be multiple, such
-    # as {system,vendor}/etc/selinux/{plat,nonplat}_mac_permissions.xml).
+    # as {system,vendor}/etc/selinux/{plat,vendor}_mac_permissions.xml).
     elif filename.endswith("mac_permissions.xml"):
       print("Rewriting %s with new keys." % (filename,))
       new_data = ReplaceCerts(data.decode())
@@ -634,11 +667,6 @@ def ProcessTargetFiles(input_tf_zip, output_tf_zip, misc_info,
     elif filename == "META/misc_info.txt":
       pass
 
-    # Skip verity public key if we will replace it.
-    elif (OPTIONS.replace_verity_public_key and
-          filename in ("BOOT/RAMDISK/verity_key",
-                       "ROOT/verity_key")):
-      pass
     elif (OPTIONS.remove_avb_public_keys and
           (filename.startswith("BOOT/RAMDISK/avb/") or
            filename.startswith("BOOT/RAMDISK/first_stage_ramdisk/avb/"))):
@@ -651,10 +679,6 @@ def ProcessTargetFiles(input_tf_zip, output_tf_zip, misc_info,
       if not matched_removal:
         # Copy it verbatim if we don't want to remove it.
         common.ZipWriteStr(output_tf_zip, out_info, data)
-
-    # Skip verity keyid (for system_root_image use) if we will replace it.
-    elif OPTIONS.replace_verity_keyid and filename == "BOOT/cmdline":
-      pass
 
     # Skip the vbmeta digest as we will recalculate it.
     elif filename == "META/vbmeta_digest.txt":
@@ -681,6 +705,39 @@ def ProcessTargetFiles(input_tf_zip, output_tf_zip, misc_info,
         print("    Rewriting AVB public key of system_other in /product")
         common.ZipWrite(output_tf_zip, public_key, filename)
 
+    # Updates pvmfw embedded public key with the virt APEX payload key.
+    elif filename == "PREBUILT_IMAGES/pvmfw.img":
+      # Find the name of the virt APEX in the target files.
+      namelist = input_tf_zip.namelist()
+      apex_gen = (GetApexFilename(f) for f in namelist if IsApexFile(f))
+      virt_apex_re = re.compile("^com\.([^\.]+\.)?android\.virt\.apex$")
+      virt_apex = next((a for a in apex_gen if virt_apex_re.match(a)), None)
+      if not virt_apex:
+        print("Removing %s from ramdisk: virt APEX not found" % filename)
+      else:
+        print("Replacing %s embedded key with %s key" % (filename, virt_apex))
+        # Get the current and new embedded keys.
+        payload_key, container_key, sign_tool = apex_keys[virt_apex]
+        new_pubkey_path = common.ExtractAvbPublicKey(
+            misc_info['avb_avbtool'], payload_key)
+        with open(new_pubkey_path, 'rb') as f:
+          new_pubkey = f.read()
+        pubkey_info = copy.copy(
+            input_tf_zip.getinfo("PREBUILT_IMAGES/pvmfw_embedded.avbpubkey"))
+        old_pubkey = input_tf_zip.read(pubkey_info.filename)
+        # Validate the keys and image.
+        if len(old_pubkey) != len(new_pubkey):
+          raise common.ExternalError("pvmfw embedded public key size mismatch")
+        pos = data.find(old_pubkey)
+        if pos == -1:
+          raise common.ExternalError("pvmfw embedded public key not found")
+        # Replace the key and copy new files.
+        new_data = data[:pos] + new_pubkey + data[pos+len(old_pubkey):]
+        common.ZipWriteStr(output_tf_zip, out_info, new_data)
+        common.ZipWriteStr(output_tf_zip, pubkey_info, new_pubkey)
+    elif filename == "PREBUILT_IMAGES/pvmfw_embedded.avbpubkey":
+      pass
+
     # Should NOT sign boot-debug.img.
     elif filename in (
         "BOOT/RAMDISK/force_debuggable",
@@ -703,27 +760,6 @@ def ProcessTargetFiles(input_tf_zip, output_tf_zip, misc_info,
 
   if OPTIONS.replace_ota_keys:
     ReplaceOtaKeys(input_tf_zip, output_tf_zip, misc_info)
-
-  # Replace the keyid string in misc_info dict.
-  if OPTIONS.replace_verity_private_key:
-    ReplaceVerityPrivateKey(misc_info, OPTIONS.replace_verity_private_key[1])
-
-  if OPTIONS.replace_verity_public_key:
-    # Replace the one in root dir in system.img.
-    ReplaceVerityPublicKey(
-        output_tf_zip, 'ROOT/verity_key', OPTIONS.replace_verity_public_key[1])
-
-    if not system_root_image:
-      # Additionally replace the copy in ramdisk if not using system-as-root.
-      ReplaceVerityPublicKey(
-          output_tf_zip,
-          'BOOT/RAMDISK/verity_key',
-          OPTIONS.replace_verity_public_key[1])
-
-  # Replace the keyid string in BOOT/cmdline.
-  if OPTIONS.replace_verity_keyid:
-    ReplaceVerityKeyId(input_tf_zip, output_tf_zip,
-                       OPTIONS.replace_verity_keyid[1])
 
   # Replace the AVB signing keys, if any.
   ReplaceAvbSigningKeys(misc_info)
@@ -840,7 +876,7 @@ def RewriteProps(data):
         pieces[-1] = EditTags(pieces[-1])
         value = "/".join(pieces)
       elif key == "ro.build.description":
-        pieces = value.split(" ")
+        pieces = value.split()
         assert pieces[-1].endswith("-keys")
         pieces[-1] = EditTags(pieces[-1])
         value = " ".join(pieces)
@@ -882,14 +918,27 @@ def ReplaceOtaKeys(input_tf_zip, output_tf_zip, misc_info):
   except KeyError:
     raise common.ExternalError("can't read META/otakeys.txt from input")
 
-  extra_recovery_keys = misc_info.get("extra_recovery_keys")
-  if extra_recovery_keys:
+  extra_ota_keys_info = misc_info.get("extra_ota_keys")
+  if extra_ota_keys_info:
+    extra_ota_keys = [OPTIONS.key_map.get(k, k) + ".x509.pem"
+                      for k in extra_ota_keys_info.split()]
+    print("extra ota key(s): " + ", ".join(extra_ota_keys))
+  else:
+    extra_ota_keys = []
+  for k in extra_ota_keys:
+    if not os.path.isfile(k):
+      raise common.ExternalError(k + " does not exist or is not a file")
+
+  extra_recovery_keys_info = misc_info.get("extra_recovery_keys")
+  if extra_recovery_keys_info:
     extra_recovery_keys = [OPTIONS.key_map.get(k, k) + ".x509.pem"
-                           for k in extra_recovery_keys.split()]
-    if extra_recovery_keys:
-      print("extra recovery-only key(s): " + ", ".join(extra_recovery_keys))
+                           for k in extra_recovery_keys_info.split()]
+    print("extra recovery-only key(s): " + ", ".join(extra_recovery_keys))
   else:
     extra_recovery_keys = []
+  for k in extra_recovery_keys:
+    if not os.path.isfile(k):
+      raise common.ExternalError(k + " does not exist or is not a file")
 
   mapped_keys = []
   for k in keylist:
@@ -912,71 +961,20 @@ def ReplaceOtaKeys(input_tf_zip, output_tf_zip, misc_info):
     mapped_keys.append(mapped_devkey + ".x509.pem")
     print("META/otakeys.txt has no keys; using %s for OTA package"
           " verification." % (mapped_keys[0],))
+  for k in mapped_keys:
+    if not os.path.isfile(k):
+      raise common.ExternalError(k + " does not exist or is not a file")
 
   otacerts = [info
               for info in input_tf_zip.infolist()
               if info.filename.endswith("/otacerts.zip")]
   for info in otacerts:
-    print("Rewriting OTA key:", info.filename, mapped_keys)
-    WriteOtacerts(output_tf_zip, info.filename, mapped_keys)
-
-
-def ReplaceVerityPublicKey(output_zip, filename, key_path):
-  """Replaces the verity public key at the given path in the given zip.
-
-  Args:
-    output_zip: The output target_files zip.
-    filename: The archive name in the output zip.
-    key_path: The path to the public key.
-  """
-  print("Replacing verity public key with %s" % (key_path,))
-  common.ZipWrite(output_zip, key_path, arcname=filename)
-
-
-def ReplaceVerityPrivateKey(misc_info, key_path):
-  """Replaces the verity private key in misc_info dict.
-
-  Args:
-    misc_info: The info dict.
-    key_path: The path to the private key in PKCS#8 format.
-  """
-  print("Replacing verity private key with %s" % (key_path,))
-  misc_info["verity_key"] = key_path
-
-
-def ReplaceVerityKeyId(input_zip, output_zip, key_path):
-  """Replaces the veritykeyid parameter in BOOT/cmdline.
-
-  Args:
-    input_zip: The input target_files zip, which should be already open.
-    output_zip: The output target_files zip, which should be already open and
-        writable.
-    key_path: The path to the PEM encoded X.509 certificate.
-  """
-  in_cmdline = input_zip.read("BOOT/cmdline").decode()
-  # Copy in_cmdline to output_zip if veritykeyid is not present.
-  if "veritykeyid" not in in_cmdline:
-    common.ZipWriteStr(output_zip, "BOOT/cmdline", in_cmdline)
-    return
-
-  out_buffer = []
-  for param in in_cmdline.split():
-    if "veritykeyid" not in param:
-      out_buffer.append(param)
-      continue
-
-    # Extract keyid using openssl command.
-    p = common.Run(["openssl", "x509", "-in", key_path, "-text"],
-                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    keyid, stderr = p.communicate()
-    assert p.returncode == 0, "Failed to dump certificate: {}".format(stderr)
-    keyid = re.search(
-        r'keyid:([0-9a-fA-F:]*)', keyid).group(1).replace(':', '').lower()
-    print("Replacing verity keyid with {}".format(keyid))
-    out_buffer.append("veritykeyid=id:%s" % (keyid,))
-
-  out_cmdline = ' '.join(out_buffer).strip() + '\n'
-  common.ZipWriteStr(output_zip, "BOOT/cmdline", out_cmdline)
+    if info.filename.startswith(("BOOT/", "RECOVERY/", "VENDOR_BOOT/")):
+      extra_keys = extra_recovery_keys
+    else:
+      extra_keys = extra_ota_keys
+    print("Rewriting OTA key:", info.filename, mapped_keys + extra_keys)
+    WriteOtacerts(output_tf_zip, info.filename, mapped_keys + extra_keys)
 
 
 def ReplaceMiscInfoTxt(input_zip, output_zip, misc_info):
@@ -1037,7 +1035,7 @@ def RewriteAvbProps(misc_info):
 
     tokens = []
     changed = False
-    for token in args.split(' '):
+    for token in args.split():
       fingerprint_key = 'com.android.build.{}.fingerprint'.format(partition)
       if not token.startswith(fingerprint_key):
         tokens.append(token)
@@ -1217,6 +1215,10 @@ def BuildVendorPartitions(output_zip_path):
   logger.info("Building vendor partitions using vendor otatools.")
   vendor_tempdir = common.UnzipTemp(output_zip_path, [
       "META/*",
+      "SYSTEM/build.prop",
+      "RECOVERY/*",
+      "BOOT/*",
+      "OTA/",
   ] + ["{}/*".format(p.upper()) for p in OPTIONS.vendor_partitions])
 
   # Disable various partitions that build based on misc_info fields.
@@ -1225,33 +1227,62 @@ def BuildVendorPartitions(output_zip_path):
   # otatools if necessary.
   vendor_misc_info_path = os.path.join(vendor_tempdir, "META/misc_info.txt")
   vendor_misc_info = common.LoadDictionaryFromFile(vendor_misc_info_path)
-  vendor_misc_info["no_boot"] = "true"  # boot
-  vendor_misc_info["vendor_boot"] = "false"  # vendor_boot
-  vendor_misc_info["no_recovery"] = "true"  # recovery
+  # Ignore if not rebuilding recovery
+  if not OPTIONS.rebuild_recovery:
+    vendor_misc_info["no_boot"] = "true"  # boot
+    vendor_misc_info["vendor_boot"] = "false"  # vendor_boot
+    vendor_misc_info["no_recovery"] = "true"  # recovery
+    vendor_misc_info["avb_enable"] = "false"  # vbmeta
+
   vendor_misc_info["board_bpt_enable"] = "false"  # partition-table
   vendor_misc_info["has_dtbo"] = "false"  # dtbo
   vendor_misc_info["has_pvmfw"] = "false"  # pvmfw
   vendor_misc_info["avb_custom_images_partition_list"] = ""  # custom images
-  vendor_misc_info["avb_enable"] = "false"  # vbmeta
+  vendor_misc_info["avb_building_vbmeta_image"] = "false" # skip building vbmeta
   vendor_misc_info["use_dynamic_partitions"] = "false"  # super_empty
   vendor_misc_info["build_super_partition"] = "false"  # super split
+  vendor_misc_info["avb_vbmeta_system"] = ""  # skip building vbmeta_system
   with open(vendor_misc_info_path, "w") as output:
     for key in sorted(vendor_misc_info):
       output.write("{}={}\n".format(key, vendor_misc_info[key]))
 
+  # Disable system partition by a placeholder of IMAGES/system.img,
+  # instead of removing SYSTEM folder.
+  # Because SYSTEM/build.prop is still needed for:
+  #   add_img_to_target_files.CreateImage ->
+  #   common.BuildInfo ->
+  #   common.BuildInfo.CalculateFingerprint
+  vendor_images_path = os.path.join(vendor_tempdir, "IMAGES")
+  if not os.path.exists(vendor_images_path):
+    os.makedirs(vendor_images_path)
+  with open(os.path.join(vendor_images_path, "system.img"), "w") as output:
+    pass
+
   # Disable care_map.pb as not all ab_partitions are available when
   # vendor otatools regenerates vendor images.
-  os.remove(os.path.join(vendor_tempdir, "META/ab_partitions.txt"))
+  if os.path.exists(os.path.join(vendor_tempdir, "META/ab_partitions.txt")):
+    os.remove(os.path.join(vendor_tempdir, "META/ab_partitions.txt"))
+  # Disable RADIO images
+  if os.path.exists(os.path.join(vendor_tempdir, "META/pack_radioimages.txt")):
+    os.remove(os.path.join(vendor_tempdir, "META/pack_radioimages.txt"))
 
   # Build vendor images using vendor otatools.
-  vendor_otatools_dir = common.MakeTempDir(prefix="vendor_otatools_")
-  common.UnzipToDir(OPTIONS.vendor_otatools, vendor_otatools_dir)
+  # Accept either a zip file or extracted directory.
+  if os.path.isfile(OPTIONS.vendor_otatools):
+    vendor_otatools_dir = common.MakeTempDir(prefix="vendor_otatools_")
+    common.UnzipToDir(OPTIONS.vendor_otatools, vendor_otatools_dir)
+  else:
+    vendor_otatools_dir = OPTIONS.vendor_otatools
   cmd = [
       os.path.join(vendor_otatools_dir, "bin", "add_img_to_target_files"),
       "--is_signing",
+      "--add_missing",
       "--verbose",
       vendor_tempdir,
   ]
+  if OPTIONS.rebuild_recovery:
+    cmd.insert(4, "--rebuild_recovery")
+
   common.RunAndCheckOutput(cmd, verbose=True)
 
   logger.info("Writing vendor partitions to output archive.")
@@ -1259,8 +1290,21 @@ def BuildVendorPartitions(output_zip_path):
       output_zip_path, "a", compression=zipfile.ZIP_DEFLATED,
       allowZip64=True) as output_zip:
     for p in OPTIONS.vendor_partitions:
-      path = "IMAGES/{}.img".format(p)
-      common.ZipWrite(output_zip, os.path.join(vendor_tempdir, path), path)
+      img_file_path = "IMAGES/{}.img".format(p)
+      map_file_path = "IMAGES/{}.map".format(p)
+      common.ZipWrite(output_zip, os.path.join(vendor_tempdir, img_file_path), img_file_path)
+      if os.path.exists(os.path.join(vendor_tempdir, map_file_path)):
+        common.ZipWrite(output_zip, os.path.join(vendor_tempdir, map_file_path), map_file_path)
+    # copy recovery.img, boot.img, recovery patch & install.sh
+    if OPTIONS.rebuild_recovery:
+      recovery_img = "IMAGES/recovery.img"
+      boot_img = "IMAGES/boot.img"
+      common.ZipWrite(output_zip, os.path.join(vendor_tempdir, recovery_img), recovery_img)
+      common.ZipWrite(output_zip, os.path.join(vendor_tempdir, boot_img), boot_img)
+      recovery_patch_path = "VENDOR/recovery-from-boot.p"
+      recovery_sh_path = "VENDOR/bin/install-recovery.sh"
+      common.ZipWrite(output_zip, os.path.join(vendor_tempdir, recovery_patch_path), recovery_patch_path)
+      common.ZipWrite(output_zip, os.path.join(vendor_tempdir, recovery_sh_path), recovery_sh_path)
 
 
 def main(argv):
@@ -1274,8 +1318,9 @@ def main(argv):
       for n in names:
         OPTIONS.extra_apks[n] = key
     elif o == "--extra_apex_payload_key":
-      apex_name, key = a.split("=")
-      OPTIONS.extra_apex_payload_keys[apex_name] = key
+      apex_names, key = a.split("=")
+      for name in apex_names.split(","):
+        OPTIONS.extra_apex_payload_keys[name] = key
     elif o == "--skip_apks_with_path_prefix":
       # Check the prefix, which must be in all upper case.
       prefix = a.split('/')[0]
@@ -1297,11 +1342,14 @@ def main(argv):
         new.append(i[0] + i[1:].strip())
       OPTIONS.tag_changes = tuple(new)
     elif o == "--replace_verity_public_key":
-      OPTIONS.replace_verity_public_key = (True, a)
+      raise ValueError("--replace_verity_public_key is no longer supported,"
+                       " please switch to AVB")
     elif o == "--replace_verity_private_key":
-      OPTIONS.replace_verity_private_key = (True, a)
+      raise ValueError("--replace_verity_private_key is no longer supported,"
+                       " please switch to AVB")
     elif o == "--replace_verity_keyid":
-      OPTIONS.replace_verity_keyid = (True, a)
+      raise ValueError("--replace_verity_keyid is no longer supported, please"
+                       " switch to AVB")
     elif o == "--remove_avb_public_keys":
       OPTIONS.remove_avb_public_keys = a.split(",")
     elif o == "--avb_vbmeta_key":
@@ -1322,6 +1370,18 @@ def main(argv):
       OPTIONS.avb_algorithms['dtbo'] = a
     elif o == "--avb_dtbo_extra_args":
       OPTIONS.avb_extra_args['dtbo'] = a
+    elif o == "--avb_init_boot_key":
+      OPTIONS.avb_keys['init_boot'] = a
+    elif o == "--avb_init_boot_algorithm":
+      OPTIONS.avb_algorithms['init_boot'] = a
+    elif o == "--avb_init_boot_extra_args":
+      OPTIONS.avb_extra_args['init_boot'] = a
+    elif o == "--avb_recovery_key":
+      OPTIONS.avb_keys['recovery'] = a
+    elif o == "--avb_recovery_algorithm":
+      OPTIONS.avb_algorithms['recovery'] = a
+    elif o == "--avb_recovery_extra_args":
+      OPTIONS.avb_extra_args['recovery'] = a
     elif o == "--avb_system_key":
       OPTIONS.avb_keys['system'] = a
     elif o == "--avb_system_algorithm":
@@ -1378,6 +1438,10 @@ def main(argv):
       OPTIONS.vendor_partitions = set(a.split(","))
     elif o == "--allow_gsi_debug_sepolicy":
       OPTIONS.allow_gsi_debug_sepolicy = True
+    elif o == "--override_apk_keys":
+      OPTIONS.override_apk_keys = a
+    elif o == "--override_apex_keys":
+      OPTIONS.override_apex_keys = a
     else:
       return False
     return True
@@ -1407,6 +1471,12 @@ def main(argv):
           "avb_dtbo_algorithm=",
           "avb_dtbo_key=",
           "avb_dtbo_extra_args=",
+          "avb_init_boot_algorithm=",
+          "avb_init_boot_key=",
+          "avb_init_boot_extra_args=",
+          "avb_recovery_algorithm=",
+          "avb_recovery_key=",
+          "avb_recovery_extra_args=",
           "avb_system_algorithm=",
           "avb_system_key=",
           "avb_system_extra_args=",
@@ -1431,6 +1501,8 @@ def main(argv):
           "vendor_partitions=",
           "vendor_otatools=",
           "allow_gsi_debug_sepolicy",
+          "override_apk_keys=",
+          "override_apex_keys=",
       ],
       extra_option_handler=option_handler)
 
@@ -1494,8 +1566,5 @@ def main(argv):
 if __name__ == '__main__':
   try:
     main(sys.argv[1:])
-  except common.ExternalError as e:
-    print("\n   ERROR: %s\n" % (e,))
-    raise
   finally:
     common.Cleanup()

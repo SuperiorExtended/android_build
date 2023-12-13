@@ -34,7 +34,6 @@ $(call inherit-product-if-exists, frameworks/webview/chromium/chromium.mk)
 PRODUCT_PACKAGES += \
     BasicDreams \
     BlockedNumberProvider \
-    Bluetooth \
     BluetoothMidiService \
     BookmarkProvider \
     BuiltInPrintService \
@@ -43,7 +42,8 @@ PRODUCT_PACKAGES += \
     CameraExtensionsProxy \
     CaptivePortalLogin \
     CertInstaller \
-    clatd \
+    CredentialManager \
+    DeviceAsWebcam \
     DocumentsUI \
     DownloadProviderUi \
     EasterEgg \
@@ -58,6 +58,7 @@ PRODUCT_PACKAGES += \
     MusicFX \
     NfcNci \
     PacProcessor \
+    preinstalled-packages-platform-handheld-system.xml \
     PrintRecommendationService \
     PrintSpooler \
     ProxyHandler \
@@ -81,7 +82,8 @@ PRODUCT_SYSTEM_SERVER_APPS += \
     Telecom \
 
 PRODUCT_COPY_FILES += \
-    frameworks/av/media/libeffects/data/audio_effects.conf:system/etc/audio_effects.conf
+    frameworks/av/media/libeffects/data/audio_effects.xml:system/etc/audio_effects.xml \
+    frameworks/native/data/etc/android.software.window_magnification.xml:$(TARGET_COPY_OUT_SYSTEM)/etc/permissions/android.software.window_magnification.xml \
 
 PRODUCT_VENDOR_PROPERTIES += \
     ro.carrier?=unknown \

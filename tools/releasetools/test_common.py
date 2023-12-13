@@ -452,12 +452,14 @@ class CommonZipTest(test_utils.ReleaseToolsTestCase):
         test_file.write(bytes(data))
       test_file.close()
 
-      expected_stat = os.stat(test_file_name)
       expected_mode = extra_zipwrite_args.get("perms", 0o644)
       expected_compress_type = extra_zipwrite_args.get("compress_type",
                                                        zipfile.ZIP_STORED)
-      time.sleep(5)  # Make sure the atime/mtime will change measurably.
 
+      # Arbitrary timestamp, just to make sure common.ZipWrite() restores
+      # the timestamp after writing.
+      os.utime(test_file_name, (1234567, 1234567))
+      expected_stat = os.stat(test_file_name)
       common.ZipWrite(zip_file, test_file_name, **extra_zipwrite_args)
       common.ZipClose(zip_file)
 
@@ -480,8 +482,6 @@ class CommonZipTest(test_utils.ReleaseToolsTestCase):
     try:
       expected_compress_type = extra_args.get("compress_type",
                                               zipfile.ZIP_STORED)
-      time.sleep(5)  # Make sure the atime/mtime will change measurably.
-
       if not isinstance(zinfo_or_arcname, zipfile.ZipInfo):
         arcname = zinfo_or_arcname
         expected_mode = extra_args.get("perms", 0o644)
@@ -528,11 +528,13 @@ class CommonZipTest(test_utils.ReleaseToolsTestCase):
         test_file.write(data)
       test_file.close()
 
+      # Arbitrary timestamp, just to make sure common.ZipWrite() restores
+      # the timestamp after writing.
+      os.utime(test_file_name, (1234567, 1234567))
       expected_stat = os.stat(test_file_name)
       expected_mode = 0o644
       expected_compress_type = extra_args.get("compress_type",
                                               zipfile.ZIP_STORED)
-      time.sleep(5)  # Make sure the atime/mtime will change measurably.
 
       common.ZipWrite(zip_file, test_file_name, **extra_args)
       common.ZipWriteStr(zip_file, arcname_small, small, **extra_args)
@@ -1631,66 +1633,7 @@ class CommonUtilsTest(test_utils.ReleaseToolsTestCase):
     self.assertEqual('3', chained_partition_args[1])
     self.assertTrue(os.path.exists(chained_partition_args[2]))
 
-  @test_utils.SkipIfExternalToolsUnavailable()
-  def test_AppendGkiSigningArgs_NoSigningKeyPath(self):
-    # A non-GKI boot.img has no gki_signing_key_path.
-    common.OPTIONS.info_dict = {
-        # 'gki_signing_key_path': pubkey,
-        'gki_signing_algorithm': 'SHA256_RSA4096',
-        'gki_signing_signature_args': '--prop foo:bar',
-    }
-
-    # Tests no --gki_signing_* args are appended if there is no
-    # gki_signing_key_path.
-    cmd = ['mkbootimg', '--header_version', '4']
-    expected_cmd = ['mkbootimg', '--header_version', '4']
-    common.AppendGkiSigningArgs(cmd)
-    self.assertEqual(cmd, expected_cmd)
-
-  def test_AppendGkiSigningArgs_NoSigningAlgorithm(self):
-    pubkey = os.path.join(self.testdata_dir, 'testkey_gki.pem')
-    with open(pubkey, 'wb') as f:
-      f.write(b'\x00' * 100)
-    self.assertTrue(os.path.exists(pubkey))
-
-    # Tests no --gki_signing_* args are appended if there is no
-    # gki_signing_algorithm.
-    common.OPTIONS.info_dict = {
-        'gki_signing_key_path': pubkey,
-        # 'gki_signing_algorithm': 'SHA256_RSA4096',
-        'gki_signing_signature_args': '--prop foo:bar',
-    }
-
-    cmd = ['mkbootimg', '--header_version', '4']
-    expected_cmd = ['mkbootimg', '--header_version', '4']
-    common.AppendGkiSigningArgs(cmd)
-    self.assertEqual(cmd, expected_cmd)
-
-  @test_utils.SkipIfExternalToolsUnavailable()
-  def test_AppendGkiSigningArgs(self):
-    pubkey = os.path.join(self.testdata_dir, 'testkey_gki.pem')
-    with open(pubkey, 'wb') as f:
-      f.write(b'\x00' * 100)
-    self.assertTrue(os.path.exists(pubkey))
-
-    common.OPTIONS.info_dict = {
-        'gki_signing_key_path': pubkey,
-        'gki_signing_algorithm': 'SHA256_RSA4096',
-        'gki_signing_signature_args': '--prop foo:bar',
-    }
-    cmd = ['mkbootimg', '--header_version', '4']
-    common.AppendGkiSigningArgs(cmd)
-
-    expected_cmd = [
-      'mkbootimg', '--header_version', '4',
-      '--gki_signing_key', pubkey,
-      '--gki_signing_algorithm', 'SHA256_RSA4096',
-      '--gki_signing_signature_args', '--prop foo:bar'
-    ]
-    self.assertEqual(cmd, expected_cmd)
-
-  @test_utils.SkipIfExternalToolsUnavailable()
-  def test_AppendGkiSigningArgs_KeyPathNotFound(self):
+  def test_GenerateGkiCertificate_KeyPathNotFound(self):
     pubkey = os.path.join(self.testdata_dir, 'no_testkey_gki.pem')
     self.assertFalse(os.path.exists(pubkey))
 
@@ -1699,41 +1642,11 @@ class CommonUtilsTest(test_utils.ReleaseToolsTestCase):
         'gki_signing_algorithm': 'SHA256_RSA4096',
         'gki_signing_signature_args': '--prop foo:bar',
     }
-    cmd = ['mkbootimg', '--header_version', '4']
-    self.assertRaises(common.ExternalError, common.AppendGkiSigningArgs, cmd)
+    test_file = tempfile.NamedTemporaryFile()
+    self.assertRaises(common.ExternalError, common._GenerateGkiCertificate,
+                      test_file.name, 'generic_kernel')
 
-  @test_utils.SkipIfExternalToolsUnavailable()
-  def test_AppendGkiSigningArgs_SearchKeyPath(self):
-    pubkey = 'testkey_gki.pem'
-    self.assertFalse(os.path.exists(pubkey))
-
-    # Tests it should replace the pubkey with an existed key under
-    # OPTIONS.search_path, i.e., os.path.join(OPTIONS.search_path, pubkey).
-    search_path_dir = common.MakeTempDir()
-    search_pubkey = os.path.join(search_path_dir, pubkey)
-    with open(search_pubkey, 'wb') as f:
-      f.write(b'\x00' * 100)
-    self.assertTrue(os.path.exists(search_pubkey))
-
-    common.OPTIONS.search_path = search_path_dir
-    common.OPTIONS.info_dict = {
-        'gki_signing_key_path': pubkey,
-        'gki_signing_algorithm': 'SHA256_RSA4096',
-        'gki_signing_signature_args': '--prop foo:bar',
-    }
-    cmd = ['mkbootimg', '--header_version', '4']
-    common.AppendGkiSigningArgs(cmd)
-
-    expected_cmd = [
-      'mkbootimg', '--header_version', '4',
-      '--gki_signing_key', search_pubkey,
-      '--gki_signing_algorithm', 'SHA256_RSA4096',
-      '--gki_signing_signature_args', '--prop foo:bar'
-    ]
-    self.assertEqual(cmd, expected_cmd)
-
-  @test_utils.SkipIfExternalToolsUnavailable()
-  def test_AppendGkiSigningArgs_SearchKeyPathNotFound(self):
+  def test_GenerateGkiCertificate_SearchKeyPathNotFound(self):
     pubkey = 'no_testkey_gki.pem'
     self.assertFalse(os.path.exists(pubkey))
 
@@ -1749,9 +1662,9 @@ class CommonUtilsTest(test_utils.ReleaseToolsTestCase):
         'gki_signing_algorithm': 'SHA256_RSA4096',
         'gki_signing_signature_args': '--prop foo:bar',
     }
-    cmd = ['mkbootimg', '--header_version', '4']
-    self.assertRaises(common.ExternalError, common.AppendGkiSigningArgs, cmd)
-
+    test_file = tempfile.NamedTemporaryFile()
+    self.assertRaises(common.ExternalError, common._GenerateGkiCertificate,
+                      test_file.name, 'generic_kernel')
 
 class InstallRecoveryScriptFormatTest(test_utils.ReleaseToolsTestCase):
   """Checks the format of install-recovery.sh.
@@ -2275,3 +2188,29 @@ class PartitionBuildPropsTest(test_utils.ReleaseToolsTestCase):
       }
       self.assertRaises(ValueError, common.PartitionBuildProps.FromInputFile,
                         input_zip, 'odm', placeholder_values)
+
+  def test_partitionBuildProps_fromInputFile_deepcopy(self):
+    build_prop = [
+        'ro.odm.build.date.utc=1578430045',
+        'ro.odm.build.fingerprint='
+        'google/coral/coral:10/RP1A.200325.001/6337676:user/dev-keys',
+        'ro.product.odm.device=coral',
+    ]
+    input_file = self._BuildZipFile({
+        'ODM/etc/build.prop': '\n'.join(build_prop),
+    })
+
+    with zipfile.ZipFile(input_file, 'r', allowZip64=True) as input_zip:
+      placeholder_values = {
+          'ro.boot.product.device_name': ['std', 'pro']
+      }
+      partition_props = common.PartitionBuildProps.FromInputFile(
+          input_zip, 'odm', placeholder_values)
+
+    copied_props = copy.deepcopy(partition_props)
+    self.assertEqual({
+      'ro.odm.build.date.utc': '1578430045',
+      'ro.odm.build.fingerprint':
+      'google/coral/coral:10/RP1A.200325.001/6337676:user/dev-keys',
+      'ro.product.odm.device': 'coral',
+    }, copied_props.build_props)

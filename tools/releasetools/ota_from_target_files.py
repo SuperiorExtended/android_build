@@ -205,7 +205,8 @@ A/B OTA specific options
 
   --partial "<PARTITION> [<PARTITION>[...]]"
       Generate partial updates, overriding ab_partitions list with the given
-      list.
+      list. Specify --partial= without partition list to let tooling auto detect
+      partial partition list.
 
   --custom_image <custom_partition=custom_image>
       Use the specified custom_image to update custom_partition when generating
@@ -230,6 +231,26 @@ A/B OTA specific options
 
   --compressor_types
       A colon ':' separated list of compressors. Allowed values are bz2 and brotli.
+
+  --enable_zucchini
+      Whether to enable to zucchini feature. Will generate smaller OTA but uses more memory.
+
+  --enable_lz4diff
+      Whether to enable lz4diff feature. Will generate smaller OTA for EROFS but
+      uses more memory.
+
+  --spl_downgrade
+      Force generate an SPL downgrade OTA. Only needed if target build has an
+      older SPL.
+
+  --vabc_compression_param
+      Compression algorithm to be used for VABC. Available options: gz, brotli, none
+
+  --security_patch_level
+      Override the security patch level in target files
+
+  --max_threads
+      Specify max number of threads allowed when generating A/B OTA
 """
 
 from __future__ import print_function
@@ -241,7 +262,6 @@ import os.path
 import re
 import shlex
 import shutil
-import struct
 import subprocess
 import sys
 import zipfile
@@ -250,11 +270,12 @@ import care_map_pb2
 import common
 import ota_utils
 from ota_utils import (UNZIP_PATTERN, FinalizeMetadata, GetPackageMetadata,
-                       PropertyFiles, SECURITY_PATCH_LEVEL_PROP_NAME, GetZipEntryOffset)
-from common import IsSparseImage
+                       PayloadGenerator, SECURITY_PATCH_LEVEL_PROP_NAME, CopyTargetFilesDir, VABC_COMPRESSION_PARAM_SUPPORT)
+from common import DoesInputFileContain, IsSparseImage
 import target_files_diff
 from check_target_files_vintf import CheckVintfIfTrebleEnabled
 from non_ab_ota import GenerateNonAbOtaPackage
+from payload_signer import PayloadSigner
 
 if sys.hexversion < 0x02070000:
   print("Python 2.7 or newer is required.", file=sys.stderr)
@@ -299,6 +320,12 @@ OPTIONS.vabc_downgrade = False
 OPTIONS.enable_vabc_xor = True
 OPTIONS.force_minor_version = None
 OPTIONS.compressor_types = None
+OPTIONS.enable_zucchini = True
+OPTIONS.enable_lz4diff = False
+OPTIONS.vabc_compression_param = None
+OPTIONS.security_patch_level = None
+OPTIONS.max_threads = None
+
 
 POSTINSTALL_CONFIG = 'META/postinstall_config.txt'
 DYNAMIC_PARTITION_INFO = 'META/dynamic_partitions_info.txt'
@@ -307,216 +334,15 @@ AB_PARTITIONS = 'META/ab_partitions.txt'
 # Files to be unzipped for target diffing purpose.
 TARGET_DIFFING_UNZIP_PATTERN = ['BOOT', 'RECOVERY', 'SYSTEM/*', 'VENDOR/*',
                                 'PRODUCT/*', 'SYSTEM_EXT/*', 'ODM/*',
-                                'VENDOR_DLKM/*', 'ODM_DLKM/*']
+                                'VENDOR_DLKM/*', 'ODM_DLKM/*', 'SYSTEM_DLKM/*']
 RETROFIT_DAP_UNZIP_PATTERN = ['OTA/super_*.img', AB_PARTITIONS]
 
 # Images to be excluded from secondary payload. We essentially only keep
 # 'system_other' and bootloader partitions.
 SECONDARY_PAYLOAD_SKIPPED_IMAGES = [
     'boot', 'dtbo', 'modem', 'odm', 'odm_dlkm', 'product', 'radio', 'recovery',
-    'system_ext', 'vbmeta', 'vbmeta_system', 'vbmeta_vendor', 'vendor',
-    'vendor_boot']
-
-
-class PayloadSigner(object):
-  """A class that wraps the payload signing works.
-
-  When generating a Payload, hashes of the payload and metadata files will be
-  signed with the device key, either by calling an external payload signer or
-  by calling openssl with the package key. This class provides a unified
-  interface, so that callers can just call PayloadSigner.Sign().
-
-  If an external payload signer has been specified (OPTIONS.payload_signer), it
-  calls the signer with the provided args (OPTIONS.payload_signer_args). Note
-  that the signing key should be provided as part of the payload_signer_args.
-  Otherwise without an external signer, it uses the package key
-  (OPTIONS.package_key) and calls openssl for the signing works.
-  """
-
-  def __init__(self):
-    if OPTIONS.payload_signer is None:
-      # Prepare the payload signing key.
-      private_key = OPTIONS.package_key + OPTIONS.private_key_suffix
-      pw = OPTIONS.key_passwords[OPTIONS.package_key]
-
-      cmd = ["openssl", "pkcs8", "-in", private_key, "-inform", "DER"]
-      cmd.extend(["-passin", "pass:" + pw] if pw else ["-nocrypt"])
-      signing_key = common.MakeTempFile(prefix="key-", suffix=".key")
-      cmd.extend(["-out", signing_key])
-      common.RunAndCheckOutput(cmd, verbose=False)
-
-      self.signer = "openssl"
-      self.signer_args = ["pkeyutl", "-sign", "-inkey", signing_key,
-                          "-pkeyopt", "digest:sha256"]
-      self.maximum_signature_size = self._GetMaximumSignatureSizeInBytes(
-          signing_key)
-    else:
-      self.signer = OPTIONS.payload_signer
-      self.signer_args = OPTIONS.payload_signer_args
-      if OPTIONS.payload_signer_maximum_signature_size:
-        self.maximum_signature_size = int(
-            OPTIONS.payload_signer_maximum_signature_size)
-      else:
-        # The legacy config uses RSA2048 keys.
-        logger.warning("The maximum signature size for payload signer is not"
-                       " set, default to 256 bytes.")
-        self.maximum_signature_size = 256
-
-  @staticmethod
-  def _GetMaximumSignatureSizeInBytes(signing_key):
-    out_signature_size_file = common.MakeTempFile("signature_size")
-    cmd = ["delta_generator", "--out_maximum_signature_size_file={}".format(
-        out_signature_size_file), "--private_key={}".format(signing_key)]
-    common.RunAndCheckOutput(cmd)
-    with open(out_signature_size_file) as f:
-      signature_size = f.read().rstrip()
-    logger.info("%s outputs the maximum signature size: %s", cmd[0],
-                signature_size)
-    return int(signature_size)
-
-  def Sign(self, in_file):
-    """Signs the given input file. Returns the output filename."""
-    out_file = common.MakeTempFile(prefix="signed-", suffix=".bin")
-    cmd = [self.signer] + self.signer_args + ['-in', in_file, '-out', out_file]
-    common.RunAndCheckOutput(cmd)
-    return out_file
-
-
-class Payload(object):
-  """Manages the creation and the signing of an A/B OTA Payload."""
-
-  PAYLOAD_BIN = 'payload.bin'
-  PAYLOAD_PROPERTIES_TXT = 'payload_properties.txt'
-  SECONDARY_PAYLOAD_BIN = 'secondary/payload.bin'
-  SECONDARY_PAYLOAD_PROPERTIES_TXT = 'secondary/payload_properties.txt'
-
-  def __init__(self, secondary=False):
-    """Initializes a Payload instance.
-
-    Args:
-      secondary: Whether it's generating a secondary payload (default: False).
-    """
-    self.payload_file = None
-    self.payload_properties = None
-    self.secondary = secondary
-
-  def _Run(self, cmd):  # pylint: disable=no-self-use
-    # Don't pipe (buffer) the output if verbose is set. Let
-    # brillo_update_payload write to stdout/stderr directly, so its progress can
-    # be monitored.
-    if OPTIONS.verbose:
-      common.RunAndCheckOutput(cmd, stdout=None, stderr=None)
-    else:
-      common.RunAndCheckOutput(cmd)
-
-  def Generate(self, target_file, source_file=None, additional_args=None):
-    """Generates a payload from the given target-files zip(s).
-
-    Args:
-      target_file: The filename of the target build target-files zip.
-      source_file: The filename of the source build target-files zip; or None if
-          generating a full OTA.
-      additional_args: A list of additional args that should be passed to
-          brillo_update_payload script; or None.
-    """
-    if additional_args is None:
-      additional_args = []
-
-    payload_file = common.MakeTempFile(prefix="payload-", suffix=".bin")
-    cmd = ["brillo_update_payload", "generate",
-           "--payload", payload_file,
-           "--target_image", target_file]
-    if source_file is not None:
-      cmd.extend(["--source_image", source_file])
-      if OPTIONS.disable_fec_computation:
-        cmd.extend(["--disable_fec_computation", "true"])
-      if OPTIONS.disable_verity_computation:
-        cmd.extend(["--disable_verity_computation", "true"])
-    cmd.extend(additional_args)
-    self._Run(cmd)
-
-    self.payload_file = payload_file
-    self.payload_properties = None
-
-  def Sign(self, payload_signer):
-    """Generates and signs the hashes of the payload and metadata.
-
-    Args:
-      payload_signer: A PayloadSigner() instance that serves the signing work.
-
-    Raises:
-      AssertionError: On any failure when calling brillo_update_payload script.
-    """
-    assert isinstance(payload_signer, PayloadSigner)
-
-    # 1. Generate hashes of the payload and metadata files.
-    payload_sig_file = common.MakeTempFile(prefix="sig-", suffix=".bin")
-    metadata_sig_file = common.MakeTempFile(prefix="sig-", suffix=".bin")
-    cmd = ["brillo_update_payload", "hash",
-           "--unsigned_payload", self.payload_file,
-           "--signature_size", str(payload_signer.maximum_signature_size),
-           "--metadata_hash_file", metadata_sig_file,
-           "--payload_hash_file", payload_sig_file]
-    self._Run(cmd)
-
-    # 2. Sign the hashes.
-    signed_payload_sig_file = payload_signer.Sign(payload_sig_file)
-    signed_metadata_sig_file = payload_signer.Sign(metadata_sig_file)
-
-    # 3. Insert the signatures back into the payload file.
-    signed_payload_file = common.MakeTempFile(prefix="signed-payload-",
-                                              suffix=".bin")
-    cmd = ["brillo_update_payload", "sign",
-           "--unsigned_payload", self.payload_file,
-           "--payload", signed_payload_file,
-           "--signature_size", str(payload_signer.maximum_signature_size),
-           "--metadata_signature_file", signed_metadata_sig_file,
-           "--payload_signature_file", signed_payload_sig_file]
-    self._Run(cmd)
-
-    # 4. Dump the signed payload properties.
-    properties_file = common.MakeTempFile(prefix="payload-properties-",
-                                          suffix=".txt")
-    cmd = ["brillo_update_payload", "properties",
-           "--payload", signed_payload_file,
-           "--properties_file", properties_file]
-    self._Run(cmd)
-
-    if self.secondary:
-      with open(properties_file, "a") as f:
-        f.write("SWITCH_SLOT_ON_REBOOT=0\n")
-
-    if OPTIONS.wipe_user_data:
-      with open(properties_file, "a") as f:
-        f.write("POWERWASH=1\n")
-
-    self.payload_file = signed_payload_file
-    self.payload_properties = properties_file
-
-  def WriteToZip(self, output_zip):
-    """Writes the payload to the given zip.
-
-    Args:
-      output_zip: The output ZipFile instance.
-    """
-    assert self.payload_file is not None
-    assert self.payload_properties is not None
-
-    if self.secondary:
-      payload_arcname = Payload.SECONDARY_PAYLOAD_BIN
-      payload_properties_arcname = Payload.SECONDARY_PAYLOAD_PROPERTIES_TXT
-    else:
-      payload_arcname = Payload.PAYLOAD_BIN
-      payload_properties_arcname = Payload.PAYLOAD_PROPERTIES_TXT
-
-    # Add the signed payload file and properties into the zip. In order to
-    # support streaming, we pack them as ZIP_STORED. So these entries can be
-    # read directly with the offset and length pairs.
-    common.ZipWrite(output_zip, self.payload_file, arcname=payload_arcname,
-                    compress_type=zipfile.ZIP_STORED)
-    common.ZipWrite(output_zip, self.payload_properties,
-                    arcname=payload_properties_arcname,
-                    compress_type=zipfile.ZIP_STORED)
+    'system_dlkm', 'system_ext', 'vbmeta', 'vbmeta_system', 'vbmeta_vendor',
+    'vendor', 'vendor_boot']
 
 
 def _LoadOemDicts(oem_source):
@@ -526,116 +352,26 @@ def _LoadOemDicts(oem_source):
 
   oem_dicts = []
   for oem_file in oem_source:
-    with open(oem_file) as fp:
-      oem_dicts.append(common.LoadDictionaryFromLines(fp.readlines()))
+    oem_dicts.append(common.LoadDictionaryFromFile(oem_file))
   return oem_dicts
 
 
-class StreamingPropertyFiles(PropertyFiles):
-  """A subclass for computing the property-files for streaming A/B OTAs."""
-
-  def __init__(self):
-    super(StreamingPropertyFiles, self).__init__()
-    self.name = 'ota-streaming-property-files'
-    self.required = (
-        # payload.bin and payload_properties.txt must exist.
-        'payload.bin',
-        'payload_properties.txt',
-    )
-    self.optional = (
-        # apex_info.pb isn't directly used in the update flow
-        'apex_info.pb',
-        # care_map is available only if dm-verity is enabled.
-        'care_map.pb',
-        'care_map.txt',
-        # compatibility.zip is available only if target supports Treble.
-        'compatibility.zip',
-    )
-
-
-class AbOtaPropertyFiles(StreamingPropertyFiles):
-  """The property-files for A/B OTA that includes payload_metadata.bin info.
-
-  Since P, we expose one more token (aka property-file), in addition to the ones
-  for streaming A/B OTA, for a virtual entry of 'payload_metadata.bin'.
-  'payload_metadata.bin' is the header part of a payload ('payload.bin'), which
-  doesn't exist as a separate ZIP entry, but can be used to verify if the
-  payload can be applied on the given device.
-
-  For backward compatibility, we keep both of the 'ota-streaming-property-files'
-  and the newly added 'ota-property-files' in P. The new token will only be
-  available in 'ota-property-files'.
+def ModifyVABCCompressionParam(content, algo):
+  """ Update update VABC Compression Param in dynamic_partitions_info.txt
+  Args:
+    content: The string content of dynamic_partitions_info.txt
+    algo: The compression algorithm should be used for VABC. See
+          https://cs.android.com/android/platform/superproject/+/master:system/core/fs_mgr/libsnapshot/cow_writer.cpp;l=127;bpv=1;bpt=1?q=CowWriter::ParseOptions&sq=
+  Returns:
+    Updated content of dynamic_partitions_info.txt , with custom compression algo
   """
-
-  def __init__(self):
-    super(AbOtaPropertyFiles, self).__init__()
-    self.name = 'ota-property-files'
-
-  def _GetPrecomputed(self, input_zip):
-    offset, size = self._GetPayloadMetadataOffsetAndSize(input_zip)
-    return ['payload_metadata.bin:{}:{}'.format(offset, size)]
-
-  @staticmethod
-  def _GetPayloadMetadataOffsetAndSize(input_zip):
-    """Computes the offset and size of the payload metadata for a given package.
-
-    (From system/update_engine/update_metadata.proto)
-    A delta update file contains all the deltas needed to update a system from
-    one specific version to another specific version. The update format is
-    represented by this struct pseudocode:
-
-    struct delta_update_file {
-      char magic[4] = "CrAU";
-      uint64 file_format_version;
-      uint64 manifest_size;  // Size of protobuf DeltaArchiveManifest
-
-      // Only present if format_version > 1:
-      uint32 metadata_signature_size;
-
-      // The Bzip2 compressed DeltaArchiveManifest
-      char manifest[metadata_signature_size];
-
-      // The signature of the metadata (from the beginning of the payload up to
-      // this location, not including the signature itself). This is a
-      // serialized Signatures message.
-      char medatada_signature_message[metadata_signature_size];
-
-      // Data blobs for files, no specific format. The specific offset
-      // and length of each data blob is recorded in the DeltaArchiveManifest.
-      struct {
-        char data[];
-      } blobs[];
-
-      // These two are not signed:
-      uint64 payload_signatures_message_size;
-      char payload_signatures_message[];
-    };
-
-    'payload-metadata.bin' contains all the bytes from the beginning of the
-    payload, till the end of 'medatada_signature_message'.
-    """
-    payload_info = input_zip.getinfo('payload.bin')
-    (payload_offset, payload_size) = GetZipEntryOffset(input_zip, payload_info)
-
-    # Read the underlying raw zipfile at specified offset
-    payload_fp = input_zip.fp
-    payload_fp.seek(payload_offset)
-    header_bin = payload_fp.read(24)
-
-    # network byte order (big-endian)
-    header = struct.unpack("!IQQL", header_bin)
-
-    # 'CrAU'
-    magic = header[0]
-    assert magic == 0x43724155, "Invalid magic: {:x}, computed offset {}" \
-        .format(magic, payload_offset)
-
-    manifest_size = header[2]
-    metadata_signature_size = header[3]
-    metadata_total = 24 + manifest_size + metadata_signature_size
-    assert metadata_total < payload_size
-
-    return (payload_offset, metadata_total)
+  output_list = []
+  for line in content.splitlines():
+    if line.startswith("virtual_ab_compression_method="):
+      continue
+    output_list.append(line)
+  output_list.append("virtual_ab_compression_method="+algo)
+  return "\n".join(output_list)
 
 
 def UpdatesInfoForSpecialUpdates(content, partitions_filter,
@@ -691,6 +427,13 @@ def GetTargetFilesZipForSecondaryImages(input_file, skip_postinstall=False):
   For the partitions that don't have secondary images, the ones for primary
   slot will be used. This is to ensure that we always have valid boot, vbmeta,
   bootloader images in the inactive slot.
+
+  After writing system_other to inactive slot's system partiiton,
+  PackageManagerService will read `ro.cp_system_other_odex`, and set
+  `sys.cppreopt` to "requested". Then, according to
+  system/extras/cppreopts/cppreopts.rc , init will mount system_other at
+  /postinstall, and execute `cppreopts` to copy optimized APKs from
+  /postinstall to /data .
 
   Args:
     input_file: The input target-files.zip file.
@@ -792,6 +535,27 @@ def ParseInfoDict(target_file_path):
     return common.LoadInfoDict(zfp)
 
 
+def GetTargetFilesZipForCustomVABCCompression(input_file, vabc_compression_param):
+  """Returns a target-files.zip with a custom VABC compression param.
+  Args:
+    input_file: The input target-files.zip path
+    vabc_compression_param: Custom Virtual AB Compression algorithm
+
+  Returns:
+    The path to modified target-files.zip
+  """
+  target_file = common.MakeTempFile(prefix="targetfiles-", suffix=".zip")
+  shutil.copyfile(input_file, target_file)
+  common.ZipDelete(target_file, DYNAMIC_PARTITION_INFO)
+  with zipfile.ZipFile(input_file, 'r', allowZip64=True) as zfp:
+    dynamic_partition_info = zfp.read(DYNAMIC_PARTITION_INFO).decode()
+    dynamic_partition_info = ModifyVABCCompressionParam(
+        dynamic_partition_info, vabc_compression_param)
+    with zipfile.ZipFile(target_file, "a", allowZip64=True) as output_zip:
+      output_zip.writestr(DYNAMIC_PARTITION_INFO, dynamic_partition_info)
+  return target_file
+
+
 def GetTargetFilesZipForPartialUpdates(input_file, ab_partitions):
   """Returns a target-files.zip for partial ota update package generation.
 
@@ -866,6 +630,9 @@ def GetTargetFilesZipForPartialUpdates(input_file, ab_partitions):
       content = input_zip.read(info_file).decode()
       modified_info = UpdatesInfoForSpecialUpdates(
           content, lambda p: p in ab_partitions)
+      if OPTIONS.vabc_compression_param and info_file == DYNAMIC_PARTITION_INFO:
+        modified_info = ModifyVABCCompressionParam(
+            modified_info, OPTIONS.vabc_compression_param)
       common.ZipWriteStr(partial_target_zip, info_file, modified_info)
 
     # TODO(xunchang) handle META/postinstall_config.txt'
@@ -972,29 +739,33 @@ def GetTargetFilesZipForCustomImagesUpdates(input_file, custom_images):
 
   Returns:
     The filename of a target-files.zip which has renamed the custom images in
-    the IMAGS/ to their partition names.
+    the IMAGES/ to their partition names.
   """
-  # Use zip2zip to avoid extracting the zipfile.
+
+  # First pass: use zip2zip to copy the target files contents, excluding
+  # the "custom" images that will be replaced.
   target_file = common.MakeTempFile(prefix="targetfiles-", suffix=".zip")
   cmd = ['zip2zip', '-i', input_file, '-o', target_file]
 
-  with zipfile.ZipFile(input_file, allowZip64=True) as input_zip:
-    namelist = input_zip.namelist()
-
-  # Write {custom_image}.img as {custom_partition}.img.
+  images = {}
   for custom_partition, custom_image in custom_images.items():
     default_custom_image = '{}.img'.format(custom_partition)
     if default_custom_image != custom_image:
-      logger.info("Update custom partition '%s' with '%s'",
-                  custom_partition, custom_image)
-      # Default custom image need to be deleted first.
-      namelist.remove('IMAGES/{}'.format(default_custom_image))
-      # IMAGES/{custom_image}.img:IMAGES/{custom_partition}.img.
-      cmd.extend(['IMAGES/{}:IMAGES/{}'.format(custom_image,
-                                               default_custom_image)])
+      src = 'IMAGES/' + custom_image
+      dst = 'IMAGES/' + default_custom_image
+      cmd.extend(['-x', dst])
+      images[dst] = src
 
-  cmd.extend(['{}:{}'.format(name, name) for name in namelist])
   common.RunAndCheckOutput(cmd)
+
+  # Second pass: write {custom_image}.img as {custom_partition}.img.
+  with zipfile.ZipFile(input_file, allowZip64=True) as input_zip:
+    with zipfile.ZipFile(target_file, 'a', allowZip64=True) as output_zip:
+      for dst, src in images.items():
+        data = input_zip.read(src)
+        logger.info("Update custom partition '%s'", dst)
+        common.ZipWriteStr(output_zip, dst, data)
+      output_zip.close()
 
   return target_file
 
@@ -1010,11 +781,12 @@ def GeneratePartitionTimestampFlagsDowngrade(
         pre_partition_state, post_partition_state):
   assert pre_partition_state is not None
   partition_timestamps = {}
-  for part in pre_partition_state:
-    partition_timestamps[part.partition_name] = part.version
   for part in post_partition_state:
-    partition_timestamps[part.partition_name] = \
-        max(part.version, partition_timestamps[part.partition_name])
+    partition_timestamps[part.partition_name] = part.version
+  for part in pre_partition_state:
+    if part.partition_name in partition_timestamps:
+      partition_timestamps[part.partition_name] = \
+          max(part.version, partition_timestamps[part.partition_name])
   return [
       "--partition_timestamps",
       ",".join([key + ":" + val for (key, val)
@@ -1063,6 +835,12 @@ def SupportsMainlineGkiUpdates(target_file):
 
 def GenerateAbOtaPackage(target_file, output_file, source_file=None):
   """Generates an Android OTA package that has A/B update payload."""
+  # If input target_files are directories, create a copy so that we can modify
+  # them directly
+  if os.path.isdir(target_file):
+    target_file = CopyTargetFilesDir(target_file)
+  if source_file is not None and os.path.isdir(source_file):
+    source_file = CopyTargetFilesDir(source_file)
   # Stage the output zip package for package signing.
   if not OPTIONS.no_signing:
     staging_file = common.MakeTempFile(suffix='.zip')
@@ -1073,6 +851,7 @@ def GenerateAbOtaPackage(target_file, output_file, source_file=None):
                                allowZip64=True)
 
   if source_file is not None:
+    source_file = ota_utils.ExtractTargetFiles(source_file)
     assert "ab_partitions" in OPTIONS.source_info_dict, \
         "META/ab_partitions.txt is required for ab_update."
     assert "ab_partitions" in OPTIONS.target_info_dict, \
@@ -1086,19 +865,95 @@ def GenerateAbOtaPackage(target_file, output_file, source_file=None):
     if not source_info.is_vabc or not target_info.is_vabc:
       logger.info("Either source or target does not support VABC, disabling.")
       OPTIONS.disable_vabc = True
+    if source_info.vabc_compression_param != target_info.vabc_compression_param:
+      logger.info("Source build and target build use different compression methods {} vs {}, default to source builds parameter {}".format(
+          source_info.vabc_compression_param, target_info.vabc_compression_param, source_info.vabc_compression_param))
+      OPTIONS.vabc_compression_param = source_info.vabc_compression_param
+
+    # Virtual AB Compression was introduced in Androd S.
+    # Later, we backported VABC to Android R. But verity support was not
+    # backported, so if VABC is used and we are on Android R, disable
+    # verity computation.
+    if not OPTIONS.disable_vabc and source_info.is_android_r:
+      OPTIONS.disable_verity_computation = True
+      OPTIONS.disable_fec_computation = True
 
   else:
     assert "ab_partitions" in OPTIONS.info_dict, \
         "META/ab_partitions.txt is required for ab_update."
     target_info = common.BuildInfo(OPTIONS.info_dict, OPTIONS.oem_dicts)
     source_info = None
+    if target_info.vabc_compression_param:
+      minimum_api_level_required = VABC_COMPRESSION_PARAM_SUPPORT[
+          target_info.vabc_compression_param]
+      if target_info.vendor_api_level < minimum_api_level_required:
+        logger.warning(
+            "This full OTA is configured to use VABC compression algorithm"
+            " {}, which is supported since"
+            " Android API level {}, but device is "
+            "launched with {} . If this full OTA is"
+            " served to a device running old build, OTA might fail due to "
+            "unsupported compression parameter. For safety, gz is used because "
+            "it's supported since day 1.".format(
+                target_info.vabc_compression_param,
+                minimum_api_level_required,
+                target_info.vendor_api_level))
+        OPTIONS.vabc_compression_param = "gz"
+
+  if OPTIONS.partial == []:
+    logger.info(
+        "Automatically detecting partial partition list from input target files.")
+    OPTIONS.partial = target_info.get(
+        "partial_ota_update_partitions_list").split()
+    assert OPTIONS.partial, "Input target_file does not have"
+    " partial_ota_update_partitions_list defined, failed to auto detect partial"
+    " partition list. Please specify list of partitions to update manually via"
+    " --partial=a,b,c , or generate a complete OTA by removing the --partial"
+    " option"
+    OPTIONS.partial.sort()
+    if source_info:
+      source_partial_list = source_info.get(
+          "partial_ota_update_partitions_list").split()
+      if source_partial_list:
+        source_partial_list.sort()
+        if source_partial_list != OPTIONS.partial:
+          logger.warning("Source build and target build have different partial partition lists. Source: %s, target: %s, taking the intersection.",
+                         source_partial_list, OPTIONS.partial)
+          OPTIONS.partial = list(
+              set(OPTIONS.partial) and set(source_partial_list))
+          OPTIONS.partial.sort()
+    logger.info("Automatically deduced partial partition list: %s",
+                OPTIONS.partial)
 
   if target_info.vendor_suppressed_vabc:
     logger.info("Vendor suppressed VABC. Disabling")
     OPTIONS.disable_vabc = True
-  if not target_info.is_vabc_xor or OPTIONS.disable_vabc:
+
+  # Both source and target build need to support VABC XOR for us to use it.
+  # Source build's update_engine must be able to write XOR ops, and target
+  # build's snapuserd must be able to interpret XOR ops.
+  if not target_info.is_vabc_xor or OPTIONS.disable_vabc or \
+          (source_info is not None and not source_info.is_vabc_xor):
     logger.info("VABC XOR Not supported, disabling")
     OPTIONS.enable_vabc_xor = False
+
+  if OPTIONS.vabc_compression_param == "none":
+    logger.info(
+        "VABC Compression algorithm is set to 'none', disabling VABC xor")
+    OPTIONS.enable_vabc_xor = False
+
+  if OPTIONS.enable_vabc_xor:
+    api_level = -1
+    if source_info is not None:
+      api_level = source_info.vendor_api_level
+    if api_level == -1:
+      api_level = target_info.vendor_api_level
+
+    # XOR is only supported on T and higher.
+    if api_level < 33:
+      logger.error("VABC XOR not supported on this vendor, disabling")
+      OPTIONS.enable_vabc_xor = False
+
   additional_args = []
 
   # Prepare custom images.
@@ -1113,20 +968,22 @@ def GenerateAbOtaPackage(target_file, output_file, source_file=None):
   elif OPTIONS.partial:
     target_file = GetTargetFilesZipForPartialUpdates(target_file,
                                                      OPTIONS.partial)
-    additional_args += ["--is_partial_update", "true"]
+  elif OPTIONS.vabc_compression_param:
+    target_file = GetTargetFilesZipForCustomVABCCompression(
+        target_file, OPTIONS.vabc_compression_param)
   elif OPTIONS.skip_postinstall:
     target_file = GetTargetFilesZipWithoutPostinstallConfig(target_file)
   # Target_file may have been modified, reparse ab_partitions
-  with zipfile.ZipFile(target_file, allowZip64=True) as zfp:
-    target_info.info_dict['ab_partitions'] = zfp.read(
-        AB_PARTITIONS).decode().strip().split("\n")
+  target_info.info_dict['ab_partitions'] = common.ReadFromInputFile(target_file,
+                                                                    AB_PARTITIONS).strip().split("\n")
 
   CheckVintfIfTrebleEnabled(target_file, target_info)
 
   # Metadata to comply with Android OTA package format.
   metadata = GetPackageMetadata(target_info, source_info)
   # Generate payload.
-  payload = Payload()
+  payload = PayloadGenerator(
+      wipe_user_data=OPTIONS.wipe_user_data, minor_version=OPTIONS.force_minor_version, is_partial_update=OPTIONS.partial)
 
   partition_timestamps_flags = []
   # Enforce a max timestamp this payload can be applied on top of.
@@ -1141,20 +998,51 @@ def GenerateAbOtaPackage(target_file, output_file, source_file=None):
     partition_timestamps_flags = GeneratePartitionTimestampFlags(
         metadata.postcondition.partition_state)
 
+  if not ota_utils.IsZucchiniCompatible(source_file, target_file):
+    logger.warning(
+        "Builds doesn't support zucchini, or source/target don't have compatible zucchini versions. Disabling zucchini.")
+    OPTIONS.enable_zucchini = False
+
+  security_patch_level = target_info.GetBuildProp(
+      "ro.build.version.security_patch")
+  if OPTIONS.security_patch_level is not None:
+    security_patch_level = OPTIONS.security_patch_level
+
+  additional_args += ["--security_patch_level", security_patch_level]
+
+  if OPTIONS.max_threads:
+    additional_args += ["--max_threads", OPTIONS.max_threads]
+
+  additional_args += ["--enable_zucchini=" +
+                      str(OPTIONS.enable_zucchini).lower()]
+
+  if not ota_utils.IsLz4diffCompatible(source_file, target_file):
+    logger.warning(
+        "Source build doesn't support lz4diff, or source/target don't have compatible lz4diff versions. Disabling lz4diff.")
+    OPTIONS.enable_lz4diff = False
+
+  additional_args += ["--enable_lz4diff=" +
+                      str(OPTIONS.enable_lz4diff).lower()]
+
+  if source_file and OPTIONS.enable_lz4diff:
+    input_tmp = common.UnzipTemp(source_file, ["META/liblz4.so"])
+    liblz4_path = os.path.join(input_tmp, "META", "liblz4.so")
+    assert os.path.exists(
+        liblz4_path), "liblz4.so not found in META/ dir of target file {}".format(liblz4_path)
+    logger.info("Enabling lz4diff %s", liblz4_path)
+    additional_args += ["--liblz4_path", liblz4_path]
+    erofs_compression_param = OPTIONS.target_info_dict.get(
+        "erofs_default_compressor")
+    assert erofs_compression_param is not None, "'erofs_default_compressor' not found in META/misc_info.txt of target build. This is required to enable lz4diff."
+    additional_args += ["--erofs_compression_param", erofs_compression_param]
+
   if OPTIONS.disable_vabc:
-    additional_args += ["--disable_vabc", "true"]
+    additional_args += ["--disable_vabc=true"]
   if OPTIONS.enable_vabc_xor:
-    additional_args += ["--enable_vabc_xor", "true"]
-  if OPTIONS.force_minor_version:
-    additional_args += ["--force_minor_version", OPTIONS.force_minor_version]
+    additional_args += ["--enable_vabc_xor=true"]
   if OPTIONS.compressor_types:
     additional_args += ["--compressor_types", OPTIONS.compressor_types]
   additional_args += ["--max_timestamp", max_timestamp]
-
-  if SupportsMainlineGkiUpdates(source_file):
-    logger.warning(
-        "Detected build with mainline GKI, include full boot image.")
-    additional_args.extend(["--full_boot", "true"])
 
   payload.Generate(
       target_file,
@@ -1163,7 +1051,10 @@ def GenerateAbOtaPackage(target_file, output_file, source_file=None):
   )
 
   # Sign the payload.
-  payload_signer = PayloadSigner()
+  pw = OPTIONS.key_passwords[OPTIONS.package_key]
+  payload_signer = PayloadSigner(
+      OPTIONS.package_key, OPTIONS.private_key_suffix,
+      pw, OPTIONS.payload_signer)
   payload.Sign(payload_signer)
 
   # Write the payload into output zip.
@@ -1176,7 +1067,7 @@ def GenerateAbOtaPackage(target_file, output_file, source_file=None):
     # building an incremental OTA. See the comments for "--include_secondary".
     secondary_target_file = GetTargetFilesZipForSecondaryImages(
         target_file, OPTIONS.skip_postinstall)
-    secondary_payload = Payload(secondary=True)
+    secondary_payload = PayloadGenerator(secondary=True)
     secondary_payload.Generate(secondary_target_file,
                                additional_args=["--max_timestamp",
                                                 max_timestamp])
@@ -1185,16 +1076,13 @@ def GenerateAbOtaPackage(target_file, output_file, source_file=None):
 
   # If dm-verity is supported for the device, copy contents of care_map
   # into A/B OTA package.
-  target_zip = zipfile.ZipFile(target_file, "r", allowZip64=True)
-  if (target_info.get("verity") == "true" or
-          target_info.get("avb_enable") == "true"):
-    care_map_list = [x for x in ["care_map.pb", "care_map.txt"] if
-                     "META/" + x in target_zip.namelist()]
-
+  if target_info.get("avb_enable") == "true":
     # Adds care_map if either the protobuf format or the plain text one exists.
-    if care_map_list:
-      care_map_name = care_map_list[0]
-      care_map_data = target_zip.read("META/" + care_map_name)
+    for care_map_name in ["care_map.pb", "care_map.txt"]:
+      if not DoesInputFileContain(target_file, "META/" + care_map_name):
+        continue
+      care_map_data = common.ReadBytesFromInputFile(
+          target_file, "META/" + care_map_name)
       # In order to support streaming, care_map needs to be packed as
       # ZIP_STORED.
       common.ZipWriteStr(output_zip, care_map_name, care_map_data,
@@ -1204,26 +1092,17 @@ def GenerateAbOtaPackage(target_file, output_file, source_file=None):
 
   # Add the source apex version for incremental ota updates, and write the
   # result apex info to the ota package.
-  ota_apex_info = ota_utils.ConstructOtaApexInfo(target_zip, source_file)
+  ota_apex_info = ota_utils.ConstructOtaApexInfo(target_file, source_file)
   if ota_apex_info is not None:
     common.ZipWriteStr(output_zip, "apex_info.pb", ota_apex_info,
                        compress_type=zipfile.ZIP_STORED)
-
-  common.ZipClose(target_zip)
 
   # We haven't written the metadata entry yet, which will be handled in
   # FinalizeMetadata().
   common.ZipClose(output_zip)
 
-  # AbOtaPropertyFiles intends to replace StreamingPropertyFiles, as it covers
-  # all the info of the latter. However, system updaters and OTA servers need to
-  # take time to switch to the new flag. We keep both of the flags for
-  # P-timeframe, and will remove StreamingPropertyFiles in later release.
-  needed_property_files = (
-      AbOtaPropertyFiles(),
-      StreamingPropertyFiles(),
-  )
-  FinalizeMetadata(metadata, staging_file, output_file, needed_property_files)
+  FinalizeMetadata(metadata, staging_file, output_file,
+                   package_key=OPTIONS.package_key)
 
 
 def main(argv):
@@ -1306,9 +1185,12 @@ def main(argv):
     elif o == "--boot_variable_file":
       OPTIONS.boot_variable_file = a
     elif o == "--partial":
-      partitions = a.split()
-      if not partitions:
-        raise ValueError("Cannot parse partitions in {}".format(a))
+      if a:
+        partitions = a.split()
+        if not partitions:
+          raise ValueError("Cannot parse partitions in {}".format(a))
+      else:
+        partitions = []
       OPTIONS.partial = partitions
     elif o == "--custom_image":
       custom_partition, custom_image = a.split("=")
@@ -1321,65 +1203,86 @@ def main(argv):
     elif o == "--vabc_downgrade":
       OPTIONS.vabc_downgrade = True
     elif o == "--enable_vabc_xor":
+      assert a.lower() in ["true", "false"]
       OPTIONS.enable_vabc_xor = a.lower() != "false"
     elif o == "--force_minor_version":
       OPTIONS.force_minor_version = a
     elif o == "--compressor_types":
       OPTIONS.compressor_types = a
+    elif o == "--enable_zucchini":
+      assert a.lower() in ["true", "false"]
+      OPTIONS.enable_zucchini = a.lower() != "false"
+    elif o == "--enable_lz4diff":
+      assert a.lower() in ["true", "false"]
+      OPTIONS.enable_lz4diff = a.lower() != "false"
+    elif o == "--vabc_compression_param":
+      OPTIONS.vabc_compression_param = a.lower()
+    elif o == "--security_patch_level":
+      OPTIONS.security_patch_level = a
+    elif o in ("--max_threads"):
+      if a.isdigit():
+        OPTIONS.max_threads = a
+      else:
+        raise ValueError("Cannot parse value %r for option %r - only "
+                         "integers are allowed." % (a, o))
     else:
       return False
     return True
 
   args = common.ParseOptions(argv, __doc__,
-                                             extra_opts="b:k:i:d:e:t:2o:",
-                                             extra_long_opts=[
-                                                 "package_key=",
-                                                 "incremental_from=",
-                                                 "full_radio",
-                                                 "full_bootloader",
-                                                 "wipe_user_data",
-                                                 "downgrade",
-                                                 "override_timestamp",
-                                                 "extra_script=",
-                                                 "worker_threads=",
-                                                 "two_step",
-                                                 "include_secondary",
-                                                 "no_signing",
-                                                 "block",
-                                                 "binary=",
-                                                 "oem_settings=",
-                                                 "oem_no_mount",
-                                                 "verify",
-                                                 "stash_threshold=",
-                                                 "log_diff=",
-                                                 "payload_signer=",
-                                                 "payload_signer_args=",
-                                                 "payload_signer_maximum_signature_size=",
-                                                 "payload_signer_key_size=",
-                                                 "extracted_input_target_files=",
-                                                 "skip_postinstall",
-                                                 "retrofit_dynamic_partitions",
-                                                 "skip_compatibility_check",
-                                                 "output_metadata_path=",
-                                                 "disable_fec_computation",
-                                                 "disable_verity_computation",
-                                                 "force_non_ab",
-                                                 "boot_variable_file=",
-                                                 "partial=",
-                                                 "custom_image=",
-                                                 "disable_vabc",
-                                                 "spl_downgrade",
-                                                 "vabc_downgrade",
-                                                 "enable_vabc_xor=",
-                                                 "force_minor_version=",
-                                                 "compressor_types=",
-                                             ], extra_option_handler=option_handler)
+                             extra_opts="b:k:i:d:e:t:2o:",
+                             extra_long_opts=[
+                                 "package_key=",
+                                 "incremental_from=",
+                                 "full_radio",
+                                 "full_bootloader",
+                                 "wipe_user_data",
+                                 "downgrade",
+                                 "override_timestamp",
+                                 "extra_script=",
+                                 "worker_threads=",
+                                 "two_step",
+                                 "include_secondary",
+                                 "no_signing",
+                                 "block",
+                                 "binary=",
+                                 "oem_settings=",
+                                 "oem_no_mount",
+                                 "verify",
+                                 "stash_threshold=",
+                                 "log_diff=",
+                                 "payload_signer=",
+                                 "payload_signer_args=",
+                                 "payload_signer_maximum_signature_size=",
+                                 "payload_signer_key_size=",
+                                 "extracted_input_target_files=",
+                                 "skip_postinstall",
+                                 "retrofit_dynamic_partitions",
+                                 "skip_compatibility_check",
+                                 "output_metadata_path=",
+                                 "disable_fec_computation",
+                                 "disable_verity_computation",
+                                 "force_non_ab",
+                                 "boot_variable_file=",
+                                 "partial=",
+                                 "custom_image=",
+                                 "disable_vabc",
+                                 "spl_downgrade",
+                                 "vabc_downgrade",
+                                 "enable_vabc_xor=",
+                                 "force_minor_version=",
+                                 "compressor_types=",
+                                 "enable_zucchini=",
+                                 "enable_lz4diff=",
+                                 "vabc_compression_param=",
+                                 "security_patch_level=",
+                                 "max_threads=",
+                             ], extra_option_handler=option_handler)
+  common.InitLogging()
 
   if len(args) != 2:
     common.Usage(__doc__)
     sys.exit(1)
-
-  common.InitLogging()
 
   # Load the build info dicts from the zip directly or the extracted input
   # directory. We don't need to unzip the entire target-files zips, because they
@@ -1391,7 +1294,7 @@ def main(argv):
   if OPTIONS.extracted_input is not None:
     OPTIONS.info_dict = common.LoadInfoDict(OPTIONS.extracted_input)
   else:
-    OPTIONS.info_dict = ParseInfoDict(args[0])
+    OPTIONS.info_dict = common.LoadInfoDict(args[0])
 
   if OPTIONS.wipe_user_data:
     if not OPTIONS.vabc_downgrade:
@@ -1473,13 +1376,23 @@ def main(argv):
           "build/make/target/product/security/testkey")
     # Get signing keys
     OPTIONS.key_passwords = common.GetKeyPasswords([OPTIONS.package_key])
-    private_key_path = OPTIONS.package_key + OPTIONS.private_key_suffix
-    if not os.path.exists(private_key_path):
-      raise common.ExternalError(
-          "Private key {} doesn't exist. Make sure you passed the"
-          " correct key path through -k option".format(
-              private_key_path)
-      )
+
+    # Only check for existence of key file if using the default signer.
+    # Because the custom signer might not need the key file AT all.
+    # b/191704641
+    if not OPTIONS.payload_signer:
+      private_key_path = OPTIONS.package_key + OPTIONS.private_key_suffix
+      if not os.path.exists(private_key_path):
+        raise common.ExternalError(
+            "Private key {} doesn't exist. Make sure you passed the"
+            " correct key path through -k option".format(
+                private_key_path)
+        )
+      signapk_abs_path = os.path.join(
+          OPTIONS.search_path, OPTIONS.signapk_path)
+      if not os.path.exists(signapk_abs_path):
+        raise common.ExternalError(
+            "Failed to find sign apk binary {} in search path {}. Make sure the correct search path is passed via -p".format(OPTIONS.signapk_path, OPTIONS.search_path))
 
   if OPTIONS.source_info_dict:
     source_build_prop = OPTIONS.source_info_dict["build.prop"]
@@ -1487,6 +1400,15 @@ def main(argv):
     source_spl = source_build_prop.GetProp(SECURITY_PATCH_LEVEL_PROP_NAME)
     target_spl = target_build_prop.GetProp(SECURITY_PATCH_LEVEL_PROP_NAME)
     is_spl_downgrade = target_spl < source_spl
+    if is_spl_downgrade and target_build_prop.GetProp("ro.build.tags") == "release-keys":
+      raise common.ExternalError(
+          "Target security patch level {} is older than source SPL {} "
+          "A locked bootloader will reject SPL downgrade no matter "
+          "what(even if data wipe is done), so SPL downgrade on any "
+          "release-keys build is not allowed.".format(target_spl, source_spl))
+
+    logger.info("SPL downgrade on %s",
+                target_build_prop.GetProp("ro.build.tags"))
     if is_spl_downgrade and not OPTIONS.spl_downgrade and not OPTIONS.downgrade:
       raise common.ExternalError(
           "Target security patch level {} is older than source SPL {} applying "
@@ -1531,8 +1453,5 @@ if __name__ == '__main__':
   try:
     common.CloseInheritedPipes()
     main(sys.argv[1:])
-  except common.ExternalError:
-    logger.exception("\n   ERROR:\n")
-    sys.exit(1)
   finally:
     common.Cleanup()

@@ -64,12 +64,19 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
+import java.security.NoSuchAlgorithmException;
 import java.security.Key;
 import java.security.KeyFactory;
+import java.security.KeyStore;
+import java.security.KeyStoreException;
+import java.security.KeyStore.PrivateKeyEntry;
 import java.security.PrivateKey;
 import java.security.Provider;
 import java.security.Security;
+import java.security.UnrecoverableEntryException;
+import java.security.UnrecoverableKeyException;
 import java.security.cert.CertificateEncodingException;
+import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.security.spec.InvalidKeySpecException;
@@ -197,26 +204,23 @@ class SignApk {
      * If a console doesn't exist, reads the password from stdin
      * If a console exists, reads the password from console and returns it as a string.
      *
-     * @param keyFile The file containing the private key.  Used to prompt the user.
+     * @param keyFileName Name of the file containing the private key.  Used to prompt the user.
      */
-    private static String readPassword(File keyFile) {
+    private static char[] readPassword(String keyFileName) {
         Console console;
-        char[] pwd;
         if ((console = System.console()) == null) {
-            System.out.print("Enter password for " + keyFile + " (password will not be hidden): ");
+            System.out.print(
+                "Enter password for " + keyFileName + " (password will not be hidden): ");
             System.out.flush();
             BufferedReader stdin = new BufferedReader(new InputStreamReader(System.in));
             try {
-                return stdin.readLine();
+                String result = stdin.readLine();
+                return result == null ? null : result.toCharArray();
             } catch (IOException ex) {
                 return null;
             }
         } else {
-            if ((pwd = console.readPassword("[%s]", "Enter password for " + keyFile)) != null) {
-                return String.valueOf(pwd);
-            } else {
-                return null;
-            }
+            return console.readPassword("[%s]", "Enter password for " + keyFileName);
         }
     }
 
@@ -239,11 +243,8 @@ class SignApk {
             return null;
         }
 
-        char[] password = readPassword(keyFile).toCharArray();
-
         SecretKeyFactory skFactory = SecretKeyFactory.getInstance(epkInfo.getAlgName());
-        Key key = skFactory.generateSecret(new PBEKeySpec(password));
-
+        Key key = skFactory.generateSecret(new PBEKeySpec(readPassword(keyFile.getPath())));
         Cipher cipher = Cipher.getInstance(epkInfo.getAlgName());
         cipher.init(Cipher.DECRYPT_MODE, key, epkInfo.getAlgParameters());
 
@@ -284,6 +285,32 @@ class SignApk {
         } finally {
             input.close();
         }
+    }
+
+    private static KeyStore createKeyStore(String keyStoreName, String keyStorePin) throws
+            CertificateException,
+            IOException,
+            KeyStoreException,
+            NoSuchAlgorithmException {
+        KeyStore keyStore = KeyStore.getInstance(keyStoreName);
+        keyStore.load(null, keyStorePin == null ? null : keyStorePin.toCharArray());
+        return keyStore;
+    }
+
+    /** Get a PKCS#11 private key from keyStore */
+    private static PrivateKey loadPrivateKeyFromKeyStore(
+            final KeyStore keyStore, final String keyName)
+            throws CertificateException, KeyStoreException, NoSuchAlgorithmException,
+                    UnrecoverableKeyException, UnrecoverableEntryException {
+        final Key key = keyStore.getKey(keyName, readPassword(keyName));
+        final PrivateKeyEntry privateKeyEntry = (PrivateKeyEntry) keyStore.getEntry(keyName, null);
+        if (privateKeyEntry == null) {
+        throw new Error(
+            "Key "
+                + keyName
+                + " not found in the token provided by PKCS11 library!");
+        }
+        return privateKeyEntry.getPrivateKey();
     }
 
     /**
@@ -874,7 +901,7 @@ class SignApk {
      * Tries to load a JSE Provider by class name. This is for custom PrivateKey
      * types that might be stored in PKCS#11-like storage.
      */
-    private static void loadProviderIfNecessary(String providerClassName) {
+    private static void loadProviderIfNecessary(String providerClassName, String providerArg) {
         if (providerClassName == null) {
             return;
         }
@@ -893,27 +920,41 @@ class SignApk {
             return;
         }
 
-        Constructor<?> constructor = null;
-        for (Constructor<?> c : klass.getConstructors()) {
-            if (c.getParameterTypes().length == 0) {
-                constructor = c;
-                break;
+        Constructor<?> constructor;
+        Object o = null;
+        if (providerArg == null) {
+            try {
+                constructor = klass.getConstructor();
+                o = constructor.newInstance();
+            } catch (ReflectiveOperationException e) {
+                e.printStackTrace();
+                System.err.println("Unable to instantiate " + providerClassName
+                        + " with a zero-arg constructor");
+                System.exit(1);
+            }
+        } else {
+            try {
+                constructor = klass.getConstructor(String.class);
+                o = constructor.newInstance(providerArg);
+            } catch (ReflectiveOperationException e) {
+                // This is expected from JDK 9+; the single-arg constructor accepting the
+                // configuration has been replaced with a configure(String) method to be invoked
+                // after instantiating the Provider with the zero-arg constructor.
+                try {
+                    constructor = klass.getConstructor();
+                    o = constructor.newInstance();
+                    // The configure method will return either the modified Provider or a new
+                    // Provider if this one cannot be configured in-place.
+                    o = klass.getMethod("configure", String.class).invoke(o, providerArg);
+                } catch (ReflectiveOperationException roe) {
+                    roe.printStackTrace();
+                    System.err.println("Unable to instantiate " + providerClassName
+                            + " with the provided argument " + providerArg);
+                    System.exit(1);
+                }
             }
         }
-        if (constructor == null) {
-            System.err.println("No zero-arg constructor found for " + providerClassName);
-            System.exit(1);
-            return;
-        }
 
-        final Object o;
-        try {
-            o = constructor.newInstance();
-        } catch (Exception e) {
-            e.printStackTrace();
-            System.exit(1);
-            return;
-        }
         if (!(o instanceof Provider)) {
             System.err.println("Not a Provider class: " + providerClassName);
             System.exit(1);
@@ -1022,6 +1063,9 @@ class SignApk {
                            "[-a <alignment>] " +
                            "[--align-file-size] " +
                            "[-providerClass <className>] " +
+                           "[-providerArg <configureArg>] " +
+                           "[-loadPrivateKeysFromKeyStore <keyStoreName>]" +
+                           "[-keyStorePin <pin>]" +
                            "[--min-sdk-version <n>] " +
                            "[--disable-v2] " +
                            "[--enable-v4] " +
@@ -1044,12 +1088,16 @@ class SignApk {
 
         boolean signWholeFile = false;
         String providerClass = null;
+        String providerArg = null;
+        String keyStoreName = null;
+        String keyStorePin = null;
         int alignment = 4;
         boolean alignFileSize = false;
         Integer minSdkVersionOverride = null;
         boolean signUsingApkSignatureSchemeV2 = true;
         boolean signUsingApkSignatureSchemeV4 = false;
         SigningCertificateLineage certLineage = null;
+        Integer rotationMinSdkVersion = null;
 
         int argstart = 0;
         while (argstart < args.length && args[argstart].startsWith("-")) {
@@ -1061,6 +1109,24 @@ class SignApk {
                     usage();
                 }
                 providerClass = args[++argstart];
+                ++argstart;
+            } else if("-providerArg".equals(args[argstart])) {
+                if (argstart + 1 >= args.length) {
+                    usage();
+                }
+                providerArg = args[++argstart];
+                ++argstart;
+            } else if ("-loadPrivateKeysFromKeyStore".equals(args[argstart])) {
+                if (argstart + 1 >= args.length) {
+                    usage();
+                }
+                keyStoreName = args[++argstart];
+                ++argstart;
+            } else if ("-keyStorePin".equals(args[argstart])) {
+                if (argstart + 1 >= args.length) {
+                    usage();
+                }
+                keyStorePin = args[++argstart];
                 ++argstart;
             } else if ("-a".equals(args[argstart])) {
                 alignment = Integer.parseInt(args[++argstart]);
@@ -1092,6 +1158,15 @@ class SignApk {
                             "Error reading lineage file: " + e.getMessage());
                 }
                 ++argstart;
+            } else if ("--rotation-min-sdk-version".equals(args[argstart])) {
+                String rotationMinSdkVersionString = args[++argstart];
+                try {
+                    rotationMinSdkVersion = Integer.parseInt(rotationMinSdkVersionString);
+                } catch (NumberFormatException e) {
+                    throw new IllegalArgumentException(
+                            "--rotation-min-sdk-version must be a decimal number: " + rotationMinSdkVersionString);
+                }
+                ++argstart;
             } else {
                 usage();
             }
@@ -1110,7 +1185,7 @@ class SignApk {
             System.exit(2);
         }
 
-        loadProviderIfNecessary(providerClass);
+        loadProviderIfNecessary(providerClass, providerArg);
 
         String inputFilename = args[numArgsExcludeV4FilePath - 2];
         String outputFilename = args[numArgsExcludeV4FilePath - 1];
@@ -1142,11 +1217,19 @@ class SignApk {
             // timestamp using the current timezone. We thus adjust the milliseconds since epoch
             // value to end up with MS-DOS timestamp of Jan 1 2009 00:00:00.
             timestamp -= TimeZone.getDefault().getOffset(timestamp);
-
+            KeyStore keyStore = null;
+            if (keyStoreName != null) {
+                keyStore = createKeyStore(keyStoreName, keyStorePin);
+            }
             PrivateKey[] privateKey = new PrivateKey[numKeys];
             for (int i = 0; i < numKeys; ++i) {
                 int argNum = argstart + i*2 + 1;
-                privateKey[i] = readPrivateKey(new File(args[argNum]));
+                if (keyStore == null) {
+                    privateKey[i] = readPrivateKey(new File(args[argNum]));
+                } else {
+                    final String keyAlias = args[argNum];
+                    privateKey[i] = loadPrivateKeyFromKeyStore(keyStore, keyAlias);
+                }
             }
             inputJar = new JarFile(new File(inputFilename), false);  // Don't verify.
 
@@ -1175,15 +1258,22 @@ class SignApk {
                     }
                 }
 
-                try (ApkSignerEngine apkSigner =
-                        new DefaultApkSignerEngine.Builder(
-                                createSignerConfigs(privateKey, publicKey), minSdkVersion)
-                                .setV1SigningEnabled(true)
-                                .setV2SigningEnabled(signUsingApkSignatureSchemeV2)
-                                .setOtherSignersSignaturesPreserved(false)
-                                .setCreatedBy("1.0 (Android SignApk)")
-                                .setSigningCertificateLineage(certLineage)
-                                .build()) {
+                DefaultApkSignerEngine.Builder builder = new DefaultApkSignerEngine.Builder(
+                    createSignerConfigs(privateKey, publicKey), minSdkVersion)
+                    .setV1SigningEnabled(true)
+                    .setV2SigningEnabled(signUsingApkSignatureSchemeV2)
+                    .setOtherSignersSignaturesPreserved(false)
+                    .setCreatedBy("1.0 (Android SignApk)");
+
+                if (certLineage != null) {
+                   builder = builder.setSigningCertificateLineage(certLineage);
+                }
+
+                if (rotationMinSdkVersion != null) {
+                   builder = builder.setMinSdkVersionForRotation(rotationMinSdkVersion);
+                }
+
+                try (ApkSignerEngine apkSigner = builder.build()) {
                     // We don't preserve the input APK's APK Signing Block (which contains v2
                     // signatures)
                     apkSigner.inputApkSigningBlock(null);
