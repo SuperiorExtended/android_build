@@ -24,7 +24,6 @@ $(call inherit-product, $(SRC_TARGET_DIR)/product/media_product.mk)
 PRODUCT_PACKAGES += \
     Contacts \
     DeskClock \
-    Gallery2 \
     LatinIME \
     preinstalled-packages-platform-handheld-product.xml \
     SettingsIntelligence \
